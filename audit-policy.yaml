@@ -1,0 +1,16 @@
+auditConfigs:
+- service: cloudfunctions.googleapis.com
+  auditLogConfigs:
+  - logType: ADMIN_READ
+  - logType: DATA_READ
+  - logType: DATA_WRITE
+- service: firestore.googleapis.com
+  auditLogConfigs:
+  - logType: ADMIN_READ
+  - logType: DATA_READ
+  - logType: DATA_WRITE
+- service: storage.googleapis.com
+  auditLogConfigs:
+  - logType: ADMIN_READ
+  - logType: DATA_READ
+  - logType: DATA_WRITE
