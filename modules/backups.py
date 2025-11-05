@@ -3,9 +3,17 @@ from flask import jsonify
 from google.cloud import storage
 from googleapiclient import discovery
 from google.auth import default
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 import traceback
+from firebase_admin import firestore
 from modules.config import BACKUP_BUCKET, COLLECTIONS_TO_BACKUP
+
+# Iraq timezone (UTC+3)
+IRAQ_TIMEZONE = timezone(timedelta(hours=3))
+
+def get_iraq_time():
+    """Get current time in Iraq timezone (UTC+3)"""
+    return datetime.now(IRAQ_TIMEZONE)
 
 
 def handle_manual_backup(decoded_token):
@@ -21,21 +29,21 @@ def handle_manual_backup(decoded_token):
             "success": True,
             "message": "Manual backup completed successfully",
             "backup": backup_result,
-            "timestamp": datetime.now().isoformat()
+            "timestamp": get_iraq_time().isoformat()
         })
         
     except Exception as e:
         return jsonify({
             "success": False,
             "error": f"Backup operation failed: {str(e)}",
-            "timestamp": datetime.now().isoformat()
+            "timestamp": get_iraq_time().isoformat()
         }), 500
 
 
 def create_firestore_backup_direct(firestore_service, project: str):
     """Create a Firestore backup with timestamp"""
     try:
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        timestamp = get_iraq_time().strftime('%Y%m%d_%H%M%S')
         backup_path = f"gs://{BACKUP_BUCKET}/firestore-backups/{timestamp}"
         
         name = f"projects/{project}/databases/(default)"
@@ -103,14 +111,14 @@ def handle_backup_status(decoded_token):
             "retention_days": 30,
             "recent_backups": backups,
             "bucket": BACKUP_BUCKET,
-            "timestamp": datetime.now().isoformat()
+            "timestamp": get_iraq_time().isoformat()
         })
         
     except Exception as e:
         return jsonify({
             "success": False,
             "error": f"Failed to get backup status: {str(e)}",
-            "timestamp": datetime.now().isoformat()
+            "timestamp": get_iraq_time().isoformat()
         }), 500
 
 
@@ -167,14 +175,14 @@ def handle_list_backups(decoded_token):
             "total_backups": len(backups_list),
             "backups": backups_list,
             "bucket": BACKUP_BUCKET,
-            "timestamp": datetime.now().isoformat()
+            "timestamp": get_iraq_time().isoformat()
         })
         
     except Exception as e:
         return jsonify({
             "error": f"Failed to list backups: {str(e)}",
             "success": False,
-            "timestamp": datetime.now().isoformat()
+            "timestamp": get_iraq_time().isoformat()
         }), 500
 
 
@@ -250,7 +258,7 @@ def handle_restore_backup(decoded_token, data):
             return jsonify({
                 "error": f"Backup timestamp is required. Received data: {data}",
                 "success": False,
-                "timestamp": datetime.now().isoformat()
+                "timestamp": get_iraq_time().isoformat()
             }), 400
         
         credentials, project = default()
@@ -267,14 +275,14 @@ def handle_restore_backup(decoded_token, data):
                     "message": f"Restore operation started for backup: {backup_timestamp}",
                     "restore_operation": restore_result,
                     "note": "Restore started but operation tracking may not be available",
-                    "timestamp": datetime.now().isoformat()
+                    "timestamp": get_iraq_time().isoformat()
                 })
             
             return jsonify({
                 "success": True,
                 "message": f"Restore operation started for backup: {backup_timestamp}",
                 "restore_operation": restore_result,
-                "timestamp": datetime.now().isoformat()
+                "timestamp": get_iraq_time().isoformat()
             })
             
         except ValueError as ve:
@@ -282,7 +290,7 @@ def handle_restore_backup(decoded_token, data):
             return jsonify({
                 "error": f"Backup validation failed: {str(ve)}",
                 "success": False,
-                "timestamp": datetime.now().isoformat()
+                "timestamp": get_iraq_time().isoformat()
             }), 404
             
         except Exception as restore_error:
@@ -291,7 +299,7 @@ def handle_restore_backup(decoded_token, data):
             return jsonify({
                 "error": f"Failed to start restore: {str(restore_error)}",
                 "success": False,
-                "timestamp": datetime.now().isoformat()
+                "timestamp": get_iraq_time().isoformat()
             }), 500
         
     except Exception as e:
@@ -299,12 +307,59 @@ def handle_restore_backup(decoded_token, data):
         return jsonify({
             "error": f"Failed to restore backup: {str(e)}",
             "success": False,
-            "timestamp": datetime.now().isoformat()
+            "timestamp": get_iraq_time().isoformat()
         }), 500
 
 
+def delete_all_collections_data(collections: list):
+    """Delete all documents from the specified collections before restore"""
+    try:
+        db = firestore.client()
+        deleted_counts = {}
+        
+        print(f"🗑️  Starting deletion of existing data from {len(collections)} collections...")
+        
+        for collection_name in collections:
+            try:
+                collection_ref = db.collection(collection_name)
+                deleted_count = 0
+                
+                # Get all documents in batches
+                while True:
+                    docs = collection_ref.limit(500).stream()
+                    batch = db.batch()
+                    batch_count = 0
+                    
+                    for doc in docs:
+                        batch.delete(doc.reference)
+                        batch_count += 1
+                    
+                    if batch_count == 0:
+                        break
+                    
+                    batch.commit()
+                    deleted_count += batch_count
+                    print(f"  ✓ Deleted {batch_count} documents from '{collection_name}' (total: {deleted_count})")
+                
+                deleted_counts[collection_name] = deleted_count
+                print(f"✅ Completed deletion of '{collection_name}': {deleted_count} documents")
+                
+            except Exception as e:
+                print(f"⚠️  Warning: Failed to delete collection '{collection_name}': {str(e)}")
+                deleted_counts[collection_name] = 0
+        
+        total_deleted = sum(deleted_counts.values())
+        print(f"🗑️  Total documents deleted: {total_deleted} across {len(collections)} collections")
+        
+        return deleted_counts
+        
+    except Exception as e:
+        print(f"❌ Error deleting collections: {str(e)}")
+        raise
+
+
 def restore_firestore_backup_direct(firestore_service, project: str, backup_timestamp: str):
-    """Restore a Firestore backup from the specified timestamp"""
+    """Restore a Firestore backup from the specified timestamp - replaces ALL existing data"""
     try:
         backup_path = f"gs://{BACKUP_BUCKET}/firestore-backups/{backup_timestamp}"
         
@@ -333,6 +388,16 @@ def restore_firestore_backup_direct(firestore_service, project: str, backup_time
         
         print(f"📥 Found backup with {len(backup_blobs)} files")
         
+        # Delete all existing data from collections before restoring
+        print(f"🗑️  Deleting all existing data from collections to ensure complete replacement...")
+        deleted_counts = {}
+        try:
+            deleted_counts = delete_all_collections_data(COLLECTIONS_TO_BACKUP)
+            print(f"✅ Successfully deleted existing data. Deleted counts: {deleted_counts}")
+        except Exception as delete_error:
+            print(f"⚠️  Warning: Failed to delete existing data: {str(delete_error)}")
+            print(f"⚠️  Proceeding with restore anyway - existing documents will be overwritten")
+        
         name = f"projects/{project}/databases/(default)"
         
         print(f"🔍 Debug: Starting importDocuments with:")
@@ -359,7 +424,7 @@ def restore_firestore_backup_direct(firestore_service, project: str, backup_time
         
         if not actual_operation_name:
             print(f"❌ Warning: No operation name in response!")
-            fallback_name = f"restore_{datetime.now().isoformat()}"
+            fallback_name = f"restore_{get_iraq_time().isoformat()}"
             print(f"⚠️ Using fallback operation name: {fallback_name}")
             return {
                 "operation_name": fallback_name,
@@ -368,6 +433,8 @@ def restore_firestore_backup_direct(firestore_service, project: str, backup_time
                 "collections": COLLECTIONS_TO_BACKUP,
                 "status": "started_without_tracking",
                 "files_count": len(backup_blobs),
+                "deleted_documents": deleted_counts,
+                "replacement_mode": "full_replacement",
                 "warning": "Operation started but cannot be tracked"
             }
         
@@ -384,7 +451,9 @@ def restore_firestore_backup_direct(firestore_service, project: str, backup_time
             "backup_timestamp": backup_timestamp,
             "collections": COLLECTIONS_TO_BACKUP,
             "status": "started",
-            "files_count": len(backup_blobs)
+            "files_count": len(backup_blobs),
+            "deleted_documents": deleted_counts,
+            "replacement_mode": "full_replacement"
         }
         
     except Exception as e:
@@ -407,7 +476,7 @@ def handle_restore_status(decoded_token, data):
             return jsonify({
                 "error": f"Operation name is required. Received data: {data}",
                 "success": False,
-                "timestamp": datetime.now().isoformat()
+                "timestamp": get_iraq_time().isoformat()
             }), 400
         
         credentials, project = default()
@@ -422,7 +491,7 @@ def handle_restore_status(decoded_token, data):
             return jsonify({
                 "success": True,
                 "operation_status": status_result,
-                "timestamp": datetime.now().isoformat()
+                "timestamp": get_iraq_time().isoformat()
             })
             
         except Exception as status_error:
@@ -430,7 +499,7 @@ def handle_restore_status(decoded_token, data):
             return jsonify({
                 "error": f"Failed to get restore status: {str(status_error)}",
                 "success": False,
-                "timestamp": datetime.now().isoformat()
+                "timestamp": get_iraq_time().isoformat()
             }), 500
         
     except Exception as e:
@@ -438,6 +507,6 @@ def handle_restore_status(decoded_token, data):
         return jsonify({
             "error": f"Failed to check restore status: {str(e)}",
             "success": False,
-            "timestamp": datetime.now().isoformat()
+            "timestamp": get_iraq_time().isoformat()
         }), 500
 

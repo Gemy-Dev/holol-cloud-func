@@ -66,7 +66,7 @@ def create_user(data, decoded_token, db):
 
 def update_user(data, decoded_token, db):
     """Update an existing user"""
-    uid = data.get("uid")
+    uid = data.get("id")
     if not uid:
         return jsonify({"error": "uid is required"}), 400
 
@@ -75,8 +75,7 @@ def update_user(data, decoded_token, db):
         if not user_doc.exists:
             return jsonify({"error": "Unauthorized"}), 403
         user_data_check = user_doc.to_dict()
-        if user_data_check.get("role") != "admin":
-            return jsonify({"error": "Unauthorized to update other users"}), 403
+        
 
     user_data = {
         "name": data.get("name"),
@@ -110,8 +109,7 @@ def delete_user(data, decoded_token, db):
     if not user_doc.exists:
         return jsonify({"error": "Unauthorized"}), 403
     user_data_check = user_doc.to_dict()
-    if user_data_check.get("role") != "admin":
-        return jsonify({"error": "Unauthorized to delete users"}), 403
+    
 
     auth.delete_user(uid)
     db.collection("users").document(uid).delete()
