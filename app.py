@@ -10,11 +10,16 @@ import os
 # Import modules
 from modules.auth import verify_token
 from modules.users import create_user, update_user, delete_user
-from modules.products import get_products, get_plan_products, get_clients
+from modules.products import get_products, get_plan_products, get_clients, delete_client_and_tasks
 from modules.tasks import create_plan_tasks
 from modules.backups import (
-    handle_manual_backup, handle_backup_status, handle_list_backups,
-    handle_restore_backup, handle_restore_status
+    handle_manual_backup,
+    handle_backup_status,
+    handle_list_backups,
+    handle_restore_backup,
+    handle_restore_status,
+    handle_download_backup_archive,
+    handle_upload_backup_archive,
 )
 from modules.notifications import handle_daily_notifications
 
@@ -103,6 +108,9 @@ def route_request(action, data, request):
     elif action == "getClients":
         return get_clients(decoded_token, db)
     
+    elif action == "deleteClient":
+        return delete_client_and_tasks(data, decoded_token, db)
+
     elif action == "createPlanTasks":
         return create_plan_tasks(data, db)
     
@@ -121,6 +129,12 @@ def route_request(action, data, request):
     
     elif action == "restoreStatus":
         return handle_restore_status(decoded_token, data)
+
+    elif action == "downloadBackupArchive":
+        return handle_download_backup_archive(decoded_token, data)
+    
+    elif action == "uploadBackupArchive":
+        return handle_upload_backup_archive(decoded_token, data)
     
     else:
         return jsonify({"error": "Invalid action"}), 400

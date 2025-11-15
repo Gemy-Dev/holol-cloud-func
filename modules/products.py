@@ -187,3 +187,53 @@ def get_clients(decoded_token, db):
         print(traceback.format_exc())
         return jsonify({"error": error_msg}), 500
 
+
+def delete_client_and_tasks(data, decoded_token, db):
+    """Delete a client and all tasks associated with that client."""
+    client_id = data.get("clientId") or data.get("id")
+    if not client_id:
+        return jsonify({"error": "clientId is required"}), 400
+
+    client_id = str(client_id)
+
+    try:
+        client_ref = db.collection("clients").document(client_id)
+        client_doc = client_ref.get()
+
+        if not client_doc.exists:
+            return jsonify({"error": "Client not found"}), 404
+
+        tasks_query = db.collection("tasks").where("clientId", "==", client_id)
+        tasks_deleted = 0
+        batch = db.batch()
+        writes_in_batch = 0
+
+        def commit_batch(current_batch, pending_ops):
+            if pending_ops == 0:
+                return current_batch, pending_ops
+            current_batch.commit()
+            return db.batch(), 0
+
+        for task_doc in tasks_query.stream():
+            batch.delete(task_doc.reference)
+            tasks_deleted += 1
+            writes_in_batch += 1
+
+            if writes_in_batch == 450:
+                batch, writes_in_batch = commit_batch(batch, writes_in_batch)
+
+        # Delete the client after removing its tasks
+        batch.delete(client_ref)
+        writes_in_batch += 1
+        batch, writes_in_batch = commit_batch(batch, writes_in_batch)
+
+        return jsonify({
+            "success": True,
+            "clientId": client_id,
+            "tasksDeleted": tasks_deleted
+        })
+    except Exception as e:
+        error_msg = f"Failed to delete client {client_id}: {str(e)}"
+        print(error_msg)
+        return jsonify({"error": error_msg}), 500
+

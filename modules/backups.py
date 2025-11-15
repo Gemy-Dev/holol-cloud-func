@@ -7,6 +7,13 @@ from datetime import datetime, timezone, timedelta
 import traceback
 from firebase_admin import firestore
 from modules.config import BACKUP_BUCKET, COLLECTIONS_TO_BACKUP
+import base64
+import os
+import re
+import tempfile
+import zipfile
+from google.auth.transport import requests as google_requests
+from urllib.parse import quote
 
 # Iraq timezone (UTC+3)
 IRAQ_TIMEZONE = timezone(timedelta(hours=3))
@@ -14,6 +21,99 @@ IRAQ_TIMEZONE = timezone(timedelta(hours=3))
 def get_iraq_time():
     """Get current time in Iraq timezone (UTC+3)"""
     return datetime.now(IRAQ_TIMEZONE)
+
+
+def _safe_extract_zip(zip_file: zipfile.ZipFile, extract_dir: str):
+    """Safely extract zip ensuring no path traversal."""
+    base_path = os.path.abspath(extract_dir)
+    for member in zip_file.namelist():
+        member_path = os.path.abspath(os.path.join(base_path, member))
+        if not member_path.startswith(base_path):
+            raise ValueError(f"Illegal path detected in archive entry: {member}")
+    zip_file.extractall(extract_dir)
+
+
+def _find_export_root(extracted_dir: str):
+    """Locate Firestore export root directory (contains overall_export_metadata)."""
+    for root, _, files in os.walk(extracted_dir):
+        for file_name in files:
+            if file_name == "overall_export_metadata" or file_name.endswith(".overall_export_metadata"):
+                return root
+    return None
+
+
+def _contains_metadata_file(entries):
+    """Check if a list of file names contains a Firestore metadata file."""
+    for entry in entries:
+        if entry == "overall_export_metadata" or entry.endswith(".overall_export_metadata"):
+            return True
+    return False
+
+
+def _validate_and_prepare_backup_structure(extracted_dir: str):
+    """
+    Validate and prepare backup structure for upload.
+    Handles multiple archive formats:
+    1. Files at root level (overall_export_metadata in extracted_dir)
+    2. Single wrapper folder (backup_YYYYMMDD_HHMMSS/overall_export_metadata)
+    3. Nested structure (any subdirectory containing overall_export_metadata)
+    
+    Returns the export root directory or None if invalid.
+    """
+    print(f"🔍 Analyzing extracted directory: {extracted_dir}")
+    
+    # List what's in the root
+    try:
+        root_contents = os.listdir(extracted_dir)
+        print(f"📂 Root contains {len(root_contents)} items:")
+        for item in root_contents[:10]:  # Show first 10 items
+            item_path = os.path.join(extracted_dir, item)
+            item_type = "dir" if os.path.isdir(item_path) else "file"
+            print(f"  - {item} ({item_type})")
+    except Exception as e:
+        print(f"❌ Error listing directory: {e}")
+        return None
+    
+    # Strategy 1: Check root level
+    if _contains_metadata_file(root_contents):
+        print(f"✓ Found Firestore export at root level: {extracted_dir}")
+        return extracted_dir
+    
+    # Strategy 2: If root contains exactly one item and it's a directory, check inside it
+    # This handles the common case of a single wrapper folder
+    if len(root_contents) == 1:
+        single_item = root_contents[0]
+        single_item_path = os.path.join(extracted_dir, single_item)
+        if os.path.isdir(single_item_path):
+            print(f"  🔍 Root has single directory '{single_item}', checking inside...")
+            try:
+                inner_contents = os.listdir(single_item_path)
+                if _contains_metadata_file(inner_contents):
+                    print(f"✓ Found Firestore export in wrapper folder: {single_item_path}")
+                    return single_item_path
+            except Exception as e:
+                print(f"❌ Error checking single directory: {e}")
+    
+    # Strategy 3: Search all subdirectories recursively
+    print(f"⚠️  No export at root or in single wrapper, searching all subdirectories...")
+    export_root = _find_export_root(extracted_dir)
+    if export_root:
+        print(f"✓ Found Firestore export via recursive search: {export_root}")
+        return export_root
+    
+    print(f"❌ No valid Firestore export found in archive")
+    return None
+
+
+def _make_blob_public_temporarily(blob):
+    """Make a blob publicly readable and return its public URL."""
+    try:
+        # Make the blob publicly readable
+        blob.make_public()
+        return blob.public_url
+    except Exception as e:
+        print(f"⚠️  Failed to make blob public: {str(e)}")
+        raise
 
 
 def handle_manual_backup(decoded_token):
@@ -186,6 +286,99 @@ def handle_list_backups(decoded_token):
         }), 500
 
 
+def handle_download_backup_archive(decoded_token, data):
+    """Generate (or reuse) a zipped backup archive and return base64 content."""
+    try:
+        backup_timestamp = (
+            data.get("backup_timestamp")
+            or data.get("timestamp")
+            or data.get("backupTimestamp")
+        )
+        force_rebuild = data.get("forceRebuild", False)
+        
+        if not backup_timestamp:
+            return jsonify({
+                "success": False,
+                "error": "backup_timestamp is required"
+            }), 400
+        
+        storage_client = storage.Client()
+        bucket = storage_client.bucket(BACKUP_BUCKET)
+        prefix = f"firestore-backups/{backup_timestamp}/"
+        blobs = list(bucket.list_blobs(prefix=prefix))
+        
+        if not blobs:
+            return jsonify({
+                "success": False,
+                "error": f"No backup found for timestamp {backup_timestamp}"
+            }), 404
+        
+        archive_blob_name = f"firestore-backups-archives/{backup_timestamp}.zip"
+        archive_blob = bucket.get_blob(archive_blob_name)
+        
+        # If archive exists and no rebuild requested, download it
+        if archive_blob and not force_rebuild:
+            archive_bytes = archive_blob.download_as_bytes()
+            return jsonify({
+                "success": True,
+                "message": "Archive already exists. Returning cached archive.",
+                "fileContent": base64.b64encode(archive_bytes).decode('utf-8'),
+                "fileName": f"backup_{backup_timestamp}.zip",
+                "sizeBytes": len(archive_bytes)
+            })
+        
+        # Build new archive
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            data_dir = os.path.join(tmp_dir, "export")
+            os.makedirs(data_dir, exist_ok=True)
+            
+            print(f"📥 Downloading {len(blobs)} files from backup {backup_timestamp}")
+            for blob in blobs:
+                rel_path = blob.name[len(prefix):]
+                if not rel_path:
+                    continue
+                local_path = os.path.join(data_dir, rel_path)
+                os.makedirs(os.path.dirname(local_path), exist_ok=True)
+                blob.download_to_filename(local_path)
+            
+            archive_path = os.path.join(tmp_dir, f"{backup_timestamp}.zip")
+            print(f"📦 Creating ZIP archive at root level (no wrapper folder)")
+            with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED) as archive_file:
+                for root, _, files in os.walk(data_dir):
+                    for file_name in files:
+                        file_path = os.path.join(root, file_name)
+                        # Store files at root of ZIP (no wrapper folder)
+                        arcname = os.path.relpath(file_path, data_dir)
+                        archive_file.write(file_path, arcname)
+                        print(f"  Added to ZIP: {arcname}")
+            
+            # Upload to cache for future requests
+            archive_blob = bucket.blob(archive_blob_name)
+            archive_blob.upload_from_filename(
+                archive_path,
+                content_type="application/zip"
+            )
+            
+            # Read the archive file and return as base64
+            with open(archive_path, "rb") as f:
+                archive_bytes = f.read()
+        
+        return jsonify({
+            "success": True,
+            "message": "Backup archive generated successfully",
+            "fileContent": base64.b64encode(archive_bytes).decode('utf-8'),
+            "fileName": f"backup_{backup_timestamp}.zip",
+            "sizeBytes": len(archive_bytes)
+        })
+    except Exception as e:
+        error_msg = f"Failed to download backup archive: {str(e)}"
+        print(error_msg)
+        return jsonify({
+            "success": False,
+            "error": error_msg
+        }), 500
+
+
 def get_restore_status_direct(firestore_service, operation_name: str):
     """Get the status of a restore operation"""
     try:
@@ -308,6 +501,141 @@ def handle_restore_backup(decoded_token, data):
             "error": f"Failed to restore backup: {str(e)}",
             "success": False,
             "timestamp": get_iraq_time().isoformat()
+        }), 500
+
+
+def handle_upload_backup_archive(decoded_token, data):
+    """Upload a zipped backup archive from client device and optionally trigger restore."""
+    try:
+        file_name = data.get("fileName")
+        file_content = data.get("fileContent")
+        backup_timestamp = (
+            data.get("backup_timestamp")
+            or data.get("timestamp")
+            or data.get("backupTimestamp")
+        )
+        restore_after_upload = data.get("restoreAfterUpload", False)
+        
+        if not file_name or not file_content:
+            return jsonify({
+                "success": False,
+                "error": "fileName and fileContent are required"
+            }), 400
+        
+        try:
+            archive_bytes = base64.b64decode(file_content)
+        except Exception as decode_error:
+            return jsonify({
+                "success": False,
+                "error": f"fileContent must be a valid base64-encoded string: {str(decode_error)}"
+            }), 400
+        
+        storage_client = storage.Client()
+        bucket = storage_client.bucket(BACKUP_BUCKET)
+        
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            archive_path = os.path.join(tmp_dir, file_name)
+            with open(archive_path, "wb") as archive_file:
+                archive_file.write(archive_bytes)
+            
+            extract_dir = os.path.join(tmp_dir, "extracted")
+            os.makedirs(extract_dir, exist_ok=True)
+            
+            print(f"📦 Extracting uploaded archive: {file_name}")
+            print(f"   Archive size: {len(archive_bytes)} bytes")
+            
+            # First, list what's in the ZIP
+            with zipfile.ZipFile(archive_path, "r") as zip_file:
+                zip_contents = zip_file.namelist()
+                print(f"   ZIP contains {len(zip_contents)} files")
+                print(f"   First 10 files in ZIP:")
+                for i, name in enumerate(zip_contents[:10]):
+                    print(f"     {i+1}. {name}")
+                
+                # Extract
+                _safe_extract_zip(zip_file, extract_dir)
+            
+            print(f"🔍 Validating backup structure...")
+            export_root = _validate_and_prepare_backup_structure(extract_dir)
+            if not export_root:
+                # List what we found to help debug
+                found_files = []
+                for root, dirs, files in os.walk(extract_dir):
+                    for f in files[:5]:  # Show first 5 files
+                        rel_path = os.path.relpath(os.path.join(root, f), extract_dir)
+                        found_files.append(rel_path)
+                
+                return jsonify({
+                    "success": False,
+                    "error": "Uploaded archive does not look like a Firestore export (missing overall_export_metadata)",
+                    "debug": {
+                        "extracted_files_sample": found_files,
+                        "hint": "The ZIP should contain Firestore export files including 'overall_export_metadata' (or '<timestamp>.overall_export_metadata')"
+                    }
+                }), 400
+            
+            if not backup_timestamp:
+                rel_path = os.path.relpath(export_root, extract_dir)
+                match = re.search(r"\d{8}_\d{6}", rel_path.replace(os.sep, "/"))
+                if match:
+                    backup_timestamp = match.group(0)
+            
+            if not backup_timestamp:
+                return jsonify({
+                    "success": False,
+                    "error": "Cannot determine backup timestamp. Provide backup_timestamp explicitly."
+                }), 400
+            
+            upload_prefix = f"firestore-backups/{backup_timestamp}/"
+            # Clean existing files for that timestamp
+            existing_blobs = list(bucket.list_blobs(prefix=upload_prefix))
+            for blob in existing_blobs:
+                blob.delete()
+            
+            uploaded_files = 0
+            total_bytes = 0
+            for root, _, files in os.walk(export_root):
+                for file_name_in_export in files:
+                    file_path = os.path.join(root, file_name_in_export)
+                    rel_path = os.path.relpath(file_path, export_root).replace("\\", "/")
+                    blob_name = f"{upload_prefix}{rel_path}"
+                    blob = bucket.blob(blob_name)
+                    blob.upload_from_filename(file_path)
+                    uploaded_files += 1
+                    total_bytes += os.path.getsize(file_path)
+        
+        response = {
+            "success": True,
+            "message": "Backup uploaded successfully",
+            "backupTimestamp": backup_timestamp,
+            "uploadedFiles": uploaded_files,
+            "totalBytes": total_bytes
+        }
+        
+        if restore_after_upload:
+            try:
+                credentials, project = default()
+                firestore_service = discovery.build("firestore", "v1", credentials=credentials)
+                restore_result = restore_firestore_backup_direct(
+                    firestore_service,
+                    project,
+                    backup_timestamp
+                )
+                response["restoreOperation"] = restore_result
+            except Exception as restore_error:
+                print(f"Restore error after upload: {str(restore_error)}")
+                response["restoreError"] = str(restore_error)
+                response["restoreOperation"] = None
+        
+        return jsonify(response)
+        
+    except Exception as e:
+        error_msg = f"Failed to upload backup archive: {str(e)}"
+        print(error_msg)
+        print(traceback.format_exc())
+        return jsonify({
+            "success": False,
+            "error": error_msg
         }), 500
 
 
