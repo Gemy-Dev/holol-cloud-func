@@ -21,7 +21,11 @@ from modules.backups import (
     handle_download_backup_archive,
     handle_upload_backup_archive,
 )
-from modules.notifications import handle_daily_notifications
+from modules.notifications import (
+    handle_daily_notifications,
+    handle_send_notification,
+    handle_send_notification_to_all,
+)
 
 # Initialize Firebase Admin SDK (once)
 cred = credentials.ApplicationDefault()
@@ -135,6 +139,12 @@ def route_request(action, data, request):
     
     elif action == "uploadBackupArchive":
         return handle_upload_backup_archive(decoded_token, data)
+    
+    elif action == "sendNotification":
+        return handle_send_notification(decoded_token, data, db)
+    
+    elif action == "sendNotificationToAll":
+        return handle_send_notification_to_all(decoded_token, data, db)
     
     else:
         return jsonify({"error": "Invalid action"}), 400

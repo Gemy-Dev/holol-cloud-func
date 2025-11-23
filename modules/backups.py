@@ -1,6 +1,6 @@
 """Backup management module."""
 from flask import jsonify
-from google.cloud import storage
+from google.cloud import storage  # type: ignore[attr-defined]
 from googleapiclient import discovery
 from google.auth import default
 from datetime import datetime, timezone, timedelta
@@ -12,8 +12,6 @@ import os
 import re
 import tempfile
 import zipfile
-from google.auth.transport import requests as google_requests
-from urllib.parse import quote
 
 # Iraq timezone (UTC+3)
 IRAQ_TIMEZONE = timezone(timedelta(hours=3))
