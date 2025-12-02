@@ -118,6 +118,13 @@ def handle_manual_backup(decoded_token):
     """Handle manual backup trigger"""
     try:
         credentials, project = default()
+        if not project:
+            return jsonify({
+                "success": False,
+                "error": "Unable to determine project ID",
+                "timestamp": get_iraq_time().isoformat()
+            }), 500
+        
         firestore_service = discovery.build("firestore", "v1", credentials=credentials)
         
         # Create backup
@@ -453,6 +460,13 @@ def handle_restore_backup(decoded_token, data):
             }), 400
         
         credentials, project = default()
+        if not project:
+            return jsonify({
+                "success": False,
+                "error": "Unable to determine project ID",
+                "timestamp": get_iraq_time().isoformat()
+            }), 500
+        
         firestore_service = discovery.build("firestore", "v1", credentials=credentials)
         
         try:
@@ -613,13 +627,17 @@ def handle_upload_backup_archive(decoded_token, data):
         if restore_after_upload:
             try:
                 credentials, project = default()
-                firestore_service = discovery.build("firestore", "v1", credentials=credentials)
-                restore_result = restore_firestore_backup_direct(
-                    firestore_service,
-                    project,
-                    backup_timestamp
-                )
-                response["restoreOperation"] = restore_result
+                if not project:
+                    response["restoreError"] = "Unable to determine project ID"
+                    response["restoreOperation"] = None
+                else:
+                    firestore_service = discovery.build("firestore", "v1", credentials=credentials)
+                    restore_result = restore_firestore_backup_direct(
+                        firestore_service,
+                        project,
+                        backup_timestamp
+                    )
+                    response["restoreOperation"] = restore_result
             except Exception as restore_error:
                 print(f"Restore error after upload: {str(restore_error)}")
                 response["restoreError"] = str(restore_error)

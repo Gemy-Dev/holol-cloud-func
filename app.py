@@ -8,7 +8,7 @@ from datetime import datetime
 import os
 
 # Import modules
-from modules.auth import verify_token
+from modules.auth import verify_token, reset_password
 from modules.users import create_user, update_user, delete_user
 from modules.products import get_products, get_plan_products, get_clients, delete_client_and_tasks
 from modules.tasks import create_plan_tasks
@@ -145,6 +145,9 @@ def route_request(action, data, request):
     
     elif action == "sendNotificationToAll":
         return handle_send_notification_to_all(decoded_token, data, db)
+    
+    elif action == "resetPassword":
+        return reset_password(data, decoded_token)
     
     else:
         return jsonify({"error": "Invalid action"}), 400

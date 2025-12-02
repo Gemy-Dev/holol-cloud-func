@@ -21,7 +21,7 @@ def handle_daily_notifications(db):
             if not fcm_token:
                 continue
 
-            tasks_ref = db.collection("tasks").where("deliveryId", "==", user_doc.id).where("taskOperation", "==", "عمل").stream()
+            tasks_ref = db.collection("tasks").where("salesRepresentativeId", "==", user_doc.id).stream()
             for task_doc in tasks_ref:
                 task = task_doc.to_dict()
                 task_date = task.get("targetDate")
@@ -161,7 +161,7 @@ def handle_send_notification_to_all(decoded_token, data, db):
         )
         
         try:
-            response = messaging.send_multicast(message)
+            response = messaging.send_multicast(message)  # type: ignore[attr-defined]
             success_count = response.success_count
             failure_count = response.failure_count
             

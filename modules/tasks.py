@@ -1,6 +1,6 @@
 """Task management module."""
 from flask import jsonify
-from firebase_admin.firestore import SERVER_TIMESTAMP
+from firebase_admin import firestore
 
 
 def _fetch_eligible_clients(department_ids, cities, db):
@@ -304,6 +304,41 @@ def _fetch_eligible_clients(department_ids, cities, db):
         raise Exception(f"Failed to fetch eligible clients: {str(e)}")
 
 
+def _extract_influencer_doctors(client):
+    """Extract influencer doctors from client's additional info.
+    
+    Args:
+        client: Client dictionary with additionalInfo
+        
+    Returns:
+        List of influencer doctor dictionaries with name, phone, email
+    """
+    influencer_doctors = []
+    
+    # Check if client has additional info
+    additional_info = client.get("additionalInfo")
+    if not additional_info:
+        return influencer_doctors
+    
+    # Get doctors list from additional info
+    doctors = additional_info.get("doctors", [])
+    if not doctors:
+        return influencer_doctors
+    
+    # Filter for influencer doctors
+    for doctor in doctors:
+        is_influencer = doctor.get("isInfluencer", False)
+        if is_influencer:
+            influencer_doctors.append({
+                "name": doctor.get("name", ""),
+                "phone": doctor.get("phone", ""),
+                "email": doctor.get("email", "")
+            })
+    
+    return influencer_doctors
+
+
+
 def _fetch_target_products_simple(product_ids, db):
     """Fetch products by their IDs (simplified version matching Dart implementation).
     
@@ -340,18 +375,19 @@ def _fetch_target_products_simple(product_ids, db):
         raise Exception(f"Failed to fetch target products: {str(e)}")
 
 
-def _create_single_task(plan_id, plan_data, client, product, marketing_task, db):
-    """Create a single task for a client and product marketing combination.
+def _create_doctor_task(plan_id, plan_data, client, product, marketing_task, doctor, db):
+    """Create a task for a specific doctor and product marketing combination.
     
     Checks for existing tasks to avoid duplicates.
-    Creates task matching the Flutter TaskModel structure.
+    Creates task matching the Flutter TaskModel structure with doctor information.
     
     Args:
         plan_id: Plan ID
-        plan_data: Plan data dictionary (to get deliveryId)
+        plan_data: Plan data dictionary
         client: Client dictionary
         product: Product dictionary
-        marketing_task: Marketing task dictionary or object
+        marketing_task: Marketing task (string or dict)
+        doctor: Doctor dictionary with name, phone, email
         db: Firestore database instance
         
     Returns:
@@ -369,13 +405,14 @@ def _create_single_task(plan_id, plan_data, client, product, marketing_task, db)
         marketing_task_data = marketing_task if marketing_task else {}
     
     try:
-        # Check if task already exists
+        # Check if task already exists for this doctor + product + marketing task combination
         existing_query = (
             db.collection("tasks")
             .where("planId", "==", plan_id)
             .where("clientId", "==", client["id"])
             .where("productId", "==", product["id"])
             .where("marketingTask", "==", marketing_task_name)
+            .where("doctorName", "==", doctor.get("name", ""))
             .limit(1)
             .stream()
         )
@@ -383,8 +420,12 @@ def _create_single_task(plan_id, plan_data, client, product, marketing_task, db)
         if list(existing_query):
             return False
         
-        # Get salesRepresentativeId from plan deliveryId
-        sales_representative_id = plan_data.get("deliveryId") or ""
+        # Get salesRepresentativeIds and salesManagerId from plan
+        sales_representative_ids = plan_data.get("salesRepresentativeIds", [])
+        sales_manager_id = plan_data.get("salesManagerId", "")
+        
+        # assignedToId - typically the first sales representative or empty
+        assigned_to_id = sales_representative_ids[0] if sales_representative_ids else ""
         
         # Get priority from client (handle both enum name and value)
         client_priority = client.get("priority")
@@ -395,22 +436,25 @@ def _create_single_task(plan_id, plan_data, client, product, marketing_task, db)
         else:
             priority_name = "medium"  # Default priority
         
-        # Create new task matching Flutter TaskModel structure
+        # Create new task matching Flutter TaskModel structure with doctor info
         task_data = {
             "taskType": "planned",  # TaskType.planned.value
-            "salesRepresentativeId": sales_representative_id,
+            "salesRepresentativeIds": sales_representative_ids,
+            "salesManagerId": sales_manager_id,
+            "assignedToId": assigned_to_id,
             "planId": plan_id,
             "clientId": client["id"],
             "targetDate": None,  # Optional, can be set later
             "productId": product["id"],
             "status": "قيد الانجاز",  # Default status (TaskStatus enum)
-            "reasonOfPostpondOrCancled": None,  # Optional
+            "cancelReason": None,  # Optional
             "state": "قيد المراجعة",  # Default review state (ReviewState enum)
             "visitResult": None,  # Optional
             "priority": priority_name,
             "note": None,  # Optional
-            "createdAt": SERVER_TIMESTAMP,
-            "updatedAt": SERVER_TIMESTAMP,
+            "doctorName": doctor.get("name", ""),  # Doctor name from influencer doctor
+            "createdAt": firestore.SERVER_TIMESTAMP,  # type: ignore[attr-defined]
+            "updatedAt": firestore.SERVER_TIMESTAMP,  # type: ignore[attr-defined]
             "marketingTask": marketing_task_data,  # Keep for backward compatibility
         }
         
@@ -420,7 +464,7 @@ def _create_single_task(plan_id, plan_data, client, product, marketing_task, db)
         return True
         
     except Exception as e:
-        raise Exception(f"Failed to create task for client {client.get('id')}, product {product.get('id')}: {str(e)}")
+        raise Exception(f"Failed to create task for doctor {doctor.get('name')}, client {client.get('id')}, product {product.get('id')}: {str(e)}")
 
 
 def create_plan_tasks(data, db):
@@ -504,39 +548,64 @@ def create_plan_tasks(data, db):
         # Fetch eligible clients - will throw detailed exception if not found
         clients = _fetch_eligible_clients(plan_departments, plan_cities, db)
         
-        # Create tasks
+        # Create tasks for influencer doctors
         created_count = 0
         skipped_count = 0
         task_errors = []
+        clients_without_doctors = 0
+        total_influencer_doctors = 0
         
         for client in clients:
-            for product in products:
-                marketing_tasks = product.get("marketingTasks", [])
-                if not marketing_tasks:
-                    continue
-                
-                for marketing_task in marketing_tasks:
-                    try:
-                        created = _create_single_task(plan_id, plan_data, client, product, marketing_task, db)
-                        if created:
-                            created_count += 1
-                        else:
-                            skipped_count += 1
-                    except Exception as task_error:
-                        task_errors.append({
-                            "clientId": client.get("id"),
-                            "productId": product.get("id"),
-                            "error": str(task_error)
-                        })
+            # Extract influencer doctors from client's additional info
+            influencer_doctors = _extract_influencer_doctors(client)
+            
+            # Track clients without influencer doctors
+            if not influencer_doctors:
+                clients_without_doctors += 1
+                continue
+            
+            total_influencer_doctors += len(influencer_doctors)
+            
+            # Loop through each influencer doctor
+            for doctor in influencer_doctors:
+                for product in products:
+                    marketing_tasks = product.get("marketingTasks", [])
+                    if not marketing_tasks:
                         continue
+                    
+                    for marketing_task in marketing_tasks:
+                        try:
+                            created = _create_doctor_task(
+                                plan_id, 
+                                plan_data, 
+                                client, 
+                                product, 
+                                marketing_task, 
+                                doctor, 
+                                db
+                            )
+                            if created:
+                                created_count += 1
+                            else:
+                                skipped_count += 1
+                        except Exception as task_error:
+                            task_errors.append({
+                                "clientId": client.get("id"),
+                                "doctorName": doctor.get("name"),
+                                "productId": product.get("id"),
+                                "error": str(task_error)
+                            })
+                            continue
         
         response = {
             "success": True,
-            "message": f"Created {created_count} tasks, skipped {skipped_count} duplicates",
+            "message": f"Created {created_count} tasks for {total_influencer_doctors} influencer doctors, skipped {skipped_count} duplicates",
             "tasksCreated": created_count,
             "tasksSkipped": skipped_count,
             "planId": plan_id,
             "clientsProcessed": len(clients),
+            "clientsWithoutInfluencerDoctors": clients_without_doctors,
+            "influencerDoctorsProcessed": total_influencer_doctors,
             "productsProcessed": len(products)
         }
         
