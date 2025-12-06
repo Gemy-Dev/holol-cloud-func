@@ -548,6 +548,18 @@ def create_plan_tasks(data, db):
         # Fetch eligible clients - will throw detailed exception if not found
         clients = _fetch_eligible_clients(plan_departments, plan_cities, db)
         
+        # Update plan with matching client IDs
+        client_ids = [client["id"] for client in clients]
+        try:
+            plan_ref = db.collection("plans").document(plan_id)
+            plan_ref.update({
+                "clientsIds": client_ids,
+                "updatedAt": firestore.SERVER_TIMESTAMP  # type: ignore[attr-defined]
+            })
+        except Exception as update_error:
+            # Log error but don't fail the task creation
+            print(f"⚠️ Warning: Failed to update plan with client IDs: {str(update_error)}")
+        
         # Create tasks for influencer doctors
         created_count = 0
         skipped_count = 0
@@ -604,6 +616,7 @@ def create_plan_tasks(data, db):
             "tasksSkipped": skipped_count,
             "planId": plan_id,
             "clientsProcessed": len(clients),
+            "clientsIds": client_ids,
             "clientsWithoutInfluencerDoctors": clients_without_doctors,
             "influencerDoctorsProcessed": total_influencer_doctors,
             "productsProcessed": len(products)
