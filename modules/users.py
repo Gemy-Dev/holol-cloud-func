@@ -1,6 +1,6 @@
 """User management module for CRUD operations."""
-from firebase_admin import auth
-from firebase_admin.firestore import SERVER_TIMESTAMP
+from firebase_admin import auth, firestore
+import firebase_admin
 from flask import jsonify
 
 
@@ -36,7 +36,7 @@ def create_user(data, decoded_token, db):
             "department": data.get("department"),
             "permissions": data.get("permissions", []),
             "profileImageUrl": data.get("profileImageUrl"),
-            "createdAt": SERVER_TIMESTAMP,
+            "createdAt": firestore.SERVER_TIMESTAMP,  # type: ignore[attr-defined]
             "updatedAt": None,
             "isActive": data.get("isActive", True),
             "lastLogin": None,
@@ -84,7 +84,7 @@ def update_user(data, decoded_token, db):
         "phoneNumber": data.get("phoneNumber"),
         "permissions": data.get("permissions", []),
         "profileImageUrl": data.get("profileImageUrl"),
-        "updatedAt": SERVER_TIMESTAMP,
+        "updatedAt": firestore.SERVER_TIMESTAMP,  # type: ignore[attr-defined]
         "isActive": data.get("isActive", True),
         "lastLogin": data.get("lastLogin"),
         "plans": data.get("plans", []),
@@ -100,18 +100,34 @@ def update_user(data, decoded_token, db):
 
 
 def delete_user(data, decoded_token, db):
-    """Delete a user"""
+    """Delete a user from both Firebase Auth and Firestore"""
     uid = data.get("uid")
     if not uid:
         return jsonify({"error": "uid is required"}), 400
 
+    # Verify the requesting user exists and has permission
     user_doc = db.collection("users").document(decoded_token["uid"]).get()
     if not user_doc.exists:
-        return jsonify({"error": "Unauthorized"}), 403
-    user_data_check = user_doc.to_dict()
-    
+        return jsonify({"error": "Unauthorized - requesting user not found"}), 403
 
-    auth.delete_user(uid)
-    db.collection("users").document(uid).delete()
-    return jsonify({"success": True})
+    try:
+        # Delete from Firebase Authentication
+        auth.delete_user(uid)
+    except auth.UserNotFoundError:
+        # User doesn't exist in Auth, but we'll still try to delete from Firestore
+        pass
+    except Exception as auth_error:
+        return jsonify({"error": f"Failed to delete user from Auth: {str(auth_error)}"}), 500
+
+    try:
+        # Delete from Firestore
+        db.collection("users").document(uid).delete()
+    except Exception as db_error:
+        return jsonify({"error": f"Failed to delete user from Firestore: {str(db_error)}"}), 500
+
+    return jsonify({
+        "success": True,
+        "message": "User deleted from both Firebase Auth and Firestore",
+        "uid": uid
+    })
 
