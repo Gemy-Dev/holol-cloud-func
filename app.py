@@ -11,7 +11,7 @@ import os
 from modules.auth import verify_token, reset_password
 from modules.users import create_user, update_user, delete_user
 from modules.products import get_products, get_plan_products, get_clients, delete_client_and_tasks
-from modules.tasks import create_plan_tasks
+from modules.tasks import create_plan_tasks, create_tasks_for_new_client
 from modules.backups import (
     handle_manual_backup,
     handle_backup_status,
@@ -117,6 +117,9 @@ def route_request(action, data, request):
 
     elif action == "createPlanTasks":
         return create_plan_tasks(data, db)
+    
+    elif action == "createTasksForNewClient":
+        return create_tasks_for_new_client(data, db)
     
     # Backup actions (admin only)
     elif action == "manualBackup":
