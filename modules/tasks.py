@@ -658,6 +658,7 @@ def create_tasks_for_new_client(data, db):
        - Filters products where client.department is in product.departmentsIds
        - Gets influencer doctors from client.additionalInfo
        - Creates tasks for each doctor, product, and marketing task combination
+       - Updates the plan to add client.id to plan.clientsIds array
     
     Args:
         data: Request data containing client information
@@ -847,6 +848,19 @@ def create_tasks_for_new_client(data, db):
                 total_created += plan_created
                 total_skipped += plan_skipped
                 
+                # Update plan to add client ID to clientsIds array
+                try:
+                    plan_ref = db.collection("plans").document(plan_id)
+                    plan_ref.update({
+                        "clientsIds": firestore.ArrayUnion([client_id])  # type: ignore[attr-defined]
+                    })
+                except Exception as update_error:
+                    # Log error but don't fail the entire operation
+                    task_errors.append({
+                        "planId": plan_id,
+                        "error": f"Failed to update plan clientsIds: {str(update_error)}"
+                    })
+                
                 plans_processed.append({
                     "planId": plan_id,
                     "planTitle": plan.get("title", ""),
@@ -887,5 +901,303 @@ def create_tasks_for_new_client(data, db):
             "error": error_msg,
             "success": False,
             "clientId": client_id
+        }), 500
+
+
+def create_tasks_from_product(data, db):
+    """Create tasks for a product added to a plan.
+    
+    This function:
+    1. Takes productId, planId, and targetSales from input
+    2. Gets the plan by its ID from plans collection
+    3. Checks if the product is already in plan.targetProductSales
+       - If yes, returns error "can't add this product to this plan, it's added before"
+    4. Gets the product by its ID from products collection
+    5. Gets all clients from clients collection where:
+       - Client's department is in product's departmentsIds
+       - Client's city is in plan's cities
+       - Client's state is "مقبول" (approved)
+    6. For each matching client:
+       - Gets influencer doctors from client
+       - Creates tasks for each doctor, product, and marketing task combination
+    7. Updates the plan:
+       - Adds {productId, targetSales} to targetProductSales
+       - Adds client IDs to clientsIds (only if not already present)
+    
+    Args:
+        data: Request data containing productId, planId, and targetSales
+        db: Firestore database instance
+        
+    Returns:
+        JSON response with success status and created tasks summary
+    """
+    # Extract and validate input data
+    product_id = data.get("productId")
+    plan_id = data.get("planId")
+    target_sales = data.get("targetSales")
+    
+    if not product_id or product_id == "":
+        return jsonify({
+            "error": "Product ID is required and must not be empty",
+            "success": False
+        }), 400
+    
+    if not plan_id or plan_id == "":
+        return jsonify({
+            "error": "Plan ID is required and must not be empty",
+            "success": False
+        }), 400
+    
+    if target_sales is None:
+        return jsonify({
+            "error": "Target sales is required",
+            "success": False
+        }), 400
+    
+    try:
+        # Get plan by ID
+        plan_doc = db.collection("plans").document(plan_id).get()
+        if not plan_doc.exists:
+            return jsonify({
+                "error": f"Plan with ID {plan_id} not found",
+                "success": False,
+                "planId": plan_id
+            }), 404
+        
+        plan = plan_doc.to_dict()
+        plan["id"] = plan_doc.id
+        
+        # Check if product is already in plan.targetProductSales
+        target_product_sales = plan.get("targetProductSales", [])
+        for item in target_product_sales:
+            if isinstance(item, dict):
+                existing_product_id = item.get("productId")
+                if existing_product_id == product_id:
+                    return jsonify({
+                        "error": "Can't add this product to this plan, it's added before",
+                        "success": False,
+                        "planId": plan_id,
+                        "productId": product_id
+                    }), 400
+        
+        # Get product by ID
+        product_doc = db.collection("products").document(product_id).get()
+        if not product_doc.exists:
+            return jsonify({
+                "error": f"Product with ID {product_id} not found",
+                "success": False,
+                "productId": product_id
+            }), 404
+        
+        product = product_doc.to_dict()
+        product["id"] = product_doc.id
+        
+        # Get product's departmentsIds
+        product_departments = product.get("departmentsIds", [])
+        if not product_departments:
+            return jsonify({
+                "success": True,
+                "message": "Product has no departments. No tasks created.",
+                "productId": product_id,
+                "tasksCreated": 0
+            })
+        
+        # Get plan's cities
+        plan_cities = plan.get("cities", [])
+        if not plan_cities:
+            return jsonify({
+                "success": True,
+                "message": "Plan has no cities. No tasks created.",
+                "planId": plan_id,
+                "tasksCreated": 0
+            })
+        
+        # Get all clients where:
+        # - Client's department is in product's departmentsIds
+        # - Client's city is in plan's cities
+        # - Client's state is "مقبول" (approved)
+        eligible_clients = []
+        approved_state = "مقبول"
+        
+        try:
+            # Query clients by department (handle Firebase whereIn limitation)
+            department_batches = []
+            batch_size = 10
+            for i in range(0, len(product_departments), batch_size):
+                batch = product_departments[i:i + batch_size]
+                department_batches.append(batch)
+            
+            for dept_batch in department_batches:
+                clients_query = (
+                    db.collection("clients")
+                    .where("department", "in", dept_batch)
+                    .where("state", "==", approved_state)
+                    .stream()
+                )
+                
+                for client_doc in clients_query:
+                    client = client_doc.to_dict()
+                    client["id"] = client_doc.id
+                    
+                    # Check if client's city is in plan's cities
+                    client_city = client.get("city")
+                    if client_city and client_city in plan_cities:
+                        eligible_clients.append(client)
+        
+        except Exception as query_error:
+            return jsonify({
+                "error": f"Failed to query clients: {str(query_error)}",
+                "success": False,
+                "planId": plan_id,
+                "productId": product_id
+            }), 500
+        
+        if not eligible_clients:
+            return jsonify({
+                "success": True,
+                "message": "No eligible clients found matching the criteria",
+                "planId": plan_id,
+                "productId": product_id,
+                "tasksCreated": 0
+            })
+        
+        # Get product's marketing tasks
+        marketing_tasks = product.get("marketingTasks", [])
+        if not marketing_tasks:
+            return jsonify({
+                "success": True,
+                "message": "Product has no marketing tasks. No tasks created.",
+                "productId": product_id,
+                "eligibleClients": len(eligible_clients),
+                "tasksCreated": 0
+            })
+        
+        # Create tasks for each client
+        total_created = 0
+        total_skipped = 0
+        task_errors = []
+        clients_processed = []
+        new_client_ids = []
+        
+        for client in eligible_clients:
+            client_id = client.get("id")
+            if not client_id:
+                continue
+            
+            # Extract influencer doctors from client
+            influencer_doctors = _extract_influencer_doctors(client)
+            if not influencer_doctors:
+                continue
+            
+            client_created = 0
+            client_skipped = 0
+            
+            # Create tasks for each doctor, product, and marketing task combination
+            for doctor in influencer_doctors:
+                for marketing_task in marketing_tasks:
+                    try:
+                        created = _create_doctor_task(
+                            plan_id,
+                            plan,
+                            client,
+                            product,
+                            marketing_task,
+                            doctor,
+                            db
+                        )
+                        if created:
+                            client_created += 1
+                        else:
+                            client_skipped += 1
+                    except Exception as task_error:
+                        task_errors.append({
+                            "clientId": client_id,
+                            "doctorName": doctor.get("name"),
+                            "productId": product_id,
+                            "error": str(task_error)
+                        })
+                        continue
+            
+            total_created += client_created
+            total_skipped += client_skipped
+            
+            clients_processed.append({
+                "clientId": client_id,
+                "tasksCreated": client_created,
+                "tasksSkipped": client_skipped,
+                "doctorsCount": len(influencer_doctors)
+            })
+            
+            # Track client ID for updating plan.clientsIds
+            new_client_ids.append(client_id)
+        
+        # Update plan's targetProductSales
+        try:
+            plan_ref = db.collection("plans").document(plan_id)
+            current_target_product_sales = plan.get("targetProductSales", [])
+            updated_target_product_sales = list(current_target_product_sales)
+            updated_target_product_sales.append({
+                "productId": product_id,
+                "targetSales": target_sales
+            })
+            plan_ref.update({
+                "targetProductSales": updated_target_product_sales
+            })
+        except Exception as update_error:
+            return jsonify({
+                "error": f"Failed to update plan targetProductSales: {str(update_error)}",
+                "success": False,
+                "planId": plan_id,
+                "tasksCreated": total_created
+            }), 500
+        
+        # Update plan's clientsIds (only add clients that are not already in the list)
+        clients_to_add = []
+        try:
+            plan_clients_ids = plan.get("clientsIds", [])
+            
+            for client_id in new_client_ids:
+                if client_id not in plan_clients_ids:
+                    clients_to_add.append(client_id)
+            
+            if clients_to_add:
+                plan_ref = db.collection("plans").document(plan_id)
+                plan_ref.update({
+                    "clientsIds": firestore.ArrayUnion(clients_to_add)  # type: ignore[attr-defined]
+                })
+        except Exception as update_error:
+            # Log error but don't fail the entire operation
+            task_errors.append({
+                "error": f"Failed to update plan clientsIds: {str(update_error)}"
+            })
+        
+        response = {
+            "success": True,
+            "message": f"Created {total_created} tasks for product across {len(clients_processed)} clients",
+            "planId": plan_id,
+            "productId": product_id,
+            "targetSales": target_sales,
+            "tasksCreated": total_created,
+            "tasksSkipped": total_skipped,
+            "eligibleClients": len(eligible_clients),
+            "clientsProcessed": clients_processed,
+            "newClientsAddedToPlan": len(clients_to_add)
+        }
+        
+        if task_errors:
+            response["taskErrors"] = task_errors
+            response["taskErrorCount"] = len(task_errors)
+        
+        return jsonify(response)
+    
+    except Exception as e:
+        error_msg = f"Failed to create tasks from product: {str(e)}"
+        print(error_msg)
+        print(traceback.format_exc())
+        return jsonify({
+            "error": error_msg,
+            "success": False,
+            "planId": plan_id,
+            "productId": product_id
         }), 500
 
