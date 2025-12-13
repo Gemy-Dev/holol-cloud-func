@@ -73,27 +73,18 @@ curl https://us-central1-medical-advisor-bd734.cloudfunctions.net/app
 - `daily_notifications` - Daily notifications (auto-scheduled)
 
 ### Email
-- `sendEmail` - Send email to one or more recipients
+- `sendEmail` - Send email to all users with `receiveEmailNotifications: true`
 
 #### Email Usage Example
 ```json
 {
   "action": "sendEmail",
   "title": "Welcome to Medical Advisor",
-  "body": "Thank you for joining our platform!",
-  "to": "user@example.com"
+  "body": "Thank you for joining our platform!"
 }
 ```
 
-#### Send to Multiple Emails
-```json
-{
-  "action": "sendEmail",
-  "title": "Important Update",
-  "body": "Please review the following updates...",
-  "to": ["user1@example.com", "user2@example.com", "user3@example.com"]
-}
-```
+**Note**: The email addresses are automatically fetched from the Firestore `users` collection where `receiveEmailNotifications` field is `true`. You don't need to specify recipient emails in the request.
 
 #### Gmail Email Configuration
 

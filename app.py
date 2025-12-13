@@ -159,7 +159,6 @@ def route_request(action, data, request):
     elif action == "sendEmail":
         title = data.get("title")
         body = data.get("body")
-        to_emails = data.get("to")
         
         if not title:
             return jsonify({"error": "title is required"}), 400
@@ -167,10 +166,7 @@ def route_request(action, data, request):
         if not body:
             return jsonify({"error": "body is required"}), 400
         
-        if not to_emails:
-            return jsonify({"error": "to (email address or list of emails) is required"}), 400
-        
-        return send_email(title, body, to_emails)
+        return send_email(title, body, db)
     
     else:
         return jsonify({"error": "Invalid action"}), 400

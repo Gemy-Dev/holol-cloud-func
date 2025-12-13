@@ -91,16 +91,55 @@ def _check_email_config():
     return True, None
 
 
-def send_email(title, body, to_emails):
-    """Send email with title and body to one or more recipients.
+def _fetch_email_recipients(db):
+    """Fetch email addresses from users collection where receiveEmailNotifications is true.
     
-    This function supports both single email and a list of emails.
+    Args:
+        db: Firestore database instance
+        
+    Returns:
+        List of email addresses (strings)
+        
+    Raises:
+        Exception: If query fails
+    """
+    try:
+        recipient_emails = []
+        
+        # Query users where receiveEmailNotifications is true
+        users_query = (
+            db.collection("users")
+            .where("receiveEmailNotifications", "==", True)
+            .stream()
+        )
+        
+        for user_doc in users_query:
+            user_data = user_doc.to_dict()
+            email = user_data.get("email")
+            
+            # Validate and add email
+            if email and isinstance(email, str):
+                email = email.strip()
+                if email and _validate_email(email):
+                    recipient_emails.append(email)
+        
+        return recipient_emails
+        
+    except Exception as e:
+        raise Exception(f"Failed to fetch email recipients from users collection: {str(e)}")
+
+
+def send_email(title, body, db):
+    """Send email with title and body to users with receiveEmailNotifications enabled.
+    
+    Fetches email addresses from Firestore users collection where 
+    receiveEmailNotifications field is true.
     Uses SMTP configuration from environment variables.
     
     Args:
         title: Email subject/title
         body: Email body content (plain text)
-        to_emails: Single email string or list of email strings
+        db: Firestore database instance
         
     Returns:
         JSON response with success status and details
@@ -127,14 +166,22 @@ def send_email(title, body, to_emails):
                 "error": f"Email configuration error: {config_error}"
             }), 500
         
-        # Normalize emails to list
+        # Fetch email recipients from Firestore users collection
         try:
-            recipient_emails = _normalize_emails(to_emails)
-        except ValueError as e:
+            recipient_emails = _fetch_email_recipients(db)
+        except Exception as e:
             return jsonify({
                 "success": False,
                 "error": str(e)
-            }), 400
+            }), 500
+        
+        # Check if any recipients found
+        if not recipient_emails:
+            return jsonify({
+                "success": False,
+                "error": "No users found with receiveEmailNotifications enabled",
+                "totalRecipients": 0
+            }), 404
         
         # Create message
         msg = MIMEMultipart()
