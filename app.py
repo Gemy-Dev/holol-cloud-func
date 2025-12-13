@@ -11,7 +11,7 @@ import os
 from modules.auth import verify_token, reset_password
 from modules.users import create_user, update_user, delete_user
 from modules.products import get_products, get_plan_products, get_clients, delete_client_and_tasks
-from modules.tasks import create_plan_tasks, create_tasks_for_new_client
+from modules.tasks import create_plan_tasks, create_tasks_for_new_client, create_tasks_from_product
 from modules.backups import (
     handle_manual_backup,
     handle_backup_status,
@@ -26,6 +26,7 @@ from modules.notifications import (
     handle_send_notification,
     handle_send_notification_to_all,
 )
+from modules.email import send_email
 
 # Initialize Firebase Admin SDK (once)
 cred = credentials.ApplicationDefault()
@@ -121,6 +122,9 @@ def route_request(action, data, request):
     elif action == "createTasksForNewClient":
         return create_tasks_for_new_client(data, db)
     
+    elif action == "createTasksFromProduct":
+        return create_tasks_from_product(data, db)
+    
     # Backup actions (admin only)
     elif action == "manualBackup":
         return handle_manual_backup(decoded_token)
@@ -151,6 +155,22 @@ def route_request(action, data, request):
     
     elif action == "resetPassword":
         return reset_password(data, decoded_token)
+    
+    elif action == "sendEmail":
+        title = data.get("title")
+        body = data.get("body")
+        to_emails = data.get("to")
+        
+        if not title:
+            return jsonify({"error": "title is required"}), 400
+        
+        if not body:
+            return jsonify({"error": "body is required"}), 400
+        
+        if not to_emails:
+            return jsonify({"error": "to (email address or list of emails) is required"}), 400
+        
+        return send_email(title, body, to_emails)
     
     else:
         return jsonify({"error": "Invalid action"}), 400
