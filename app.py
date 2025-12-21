@@ -11,7 +11,7 @@ import os
 from modules.auth import verify_token, reset_password
 from modules.users import create_user, update_user, delete_user
 from modules.products import get_products, get_plan_products, get_clients, delete_client_and_tasks
-from modules.tasks import create_plan_tasks, create_tasks_for_new_client, create_tasks_from_product
+from modules.tasks import create_plan_tasks, create_tasks_for_new_client, create_tasks_from_product, get_task_stats, get_tasks_by_date_range
 from modules.backups import (
     handle_manual_backup,
     handle_backup_status,
@@ -124,6 +124,12 @@ def route_request(action, data, request):
     
     elif action == "createTasksFromProduct":
         return create_tasks_from_product(data, db)
+    
+    elif action == "getStats":
+        return get_task_stats(decoded_token, db)
+
+    elif action == "getTasksByDateRange":
+        return get_tasks_by_date_range(data, decoded_token, db)
     
     # Backup actions (admin only)
     elif action == "manualBackup":
