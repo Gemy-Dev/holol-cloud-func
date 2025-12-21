@@ -22,9 +22,9 @@ COLLECTIONS_TO_BACKUP = [
 # 4. Use that password in EMAIL_SMTP_PASSWORD
 EMAIL_SMTP_HOST = os.getenv("EMAIL_SMTP_HOST", "smtp.gmail.com")
 EMAIL_SMTP_PORT = int(os.getenv("EMAIL_SMTP_PORT", "587"))  # 587 for TLS, 465 for SSL
-EMAIL_SMTP_USER = os.getenv("EMAIL_SMTP_USER", "")  # Your Gmail address
-EMAIL_SMTP_PASSWORD = os.getenv("EMAIL_SMTP_PASSWORD", "")  # Gmail App Password (not regular password)
-EMAIL_FROM_ADDRESS = os.getenv("EMAIL_FROM_ADDRESS", "")  # Usually same as EMAIL_SMTP_USER
-EMAIL_FROM_NAME = os.getenv("EMAIL_FROM_NAME", "Medical Advisor")
+EMAIL_SMTP_USER = os.getenv("EMAIL_SMTP_USER", "zaid.h.dev@gmail.com")  # Your Gmail address
+EMAIL_SMTP_PASSWORD = os.getenv("EMAIL_SMTP_PASSWORD", "cacivoxvpwlyoarq")  # Gmail App Password (not regular password)
+EMAIL_FROM_ADDRESS = os.getenv("EMAIL_FROM_ADDRESS", "zaid.h.dev@gmail.com")  # Usually same as EMAIL_SMTP_USER
+EMAIL_FROM_NAME = os.getenv("EMAIL_FROM_NAME", "holol-tibbiya")
 
 

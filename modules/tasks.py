@@ -2,12 +2,13 @@
 from flask import jsonify
 from firebase_admin import firestore
 import traceback
+from datetime import datetime
 
 
 def _fetch_eligible_clients(department_ids, cities, db):
     """Fetch eligible clients based on departments and cities.
     
-    Only returns clients with state "مقبول" (approved).
+    Only returns clients with state "approved" (approved).
     Handles Firebase whereIn limitation (max 10 values) by batching.
     Returns detailed error information if no clients found.
     
@@ -96,7 +97,7 @@ def _fetch_eligible_clients(department_ids, cities, db):
         diagnostic_info["all_db_cities"] = list(all_db_cities)[:50]  # All cities found in DB
         
         # Test individual queries for diagnostics (with approved state filter)
-        approved_state = "مقبول"
+        approved_state = "approved"
         for dept_id in department_ids_list[:5]:
             try:
                 dept_results = list(
@@ -154,7 +155,7 @@ def _fetch_eligible_clients(department_ids, cities, db):
         cities_set = {str(city).strip() for city in cities_list}
         
         # Approved state to filter by
-        approved_state = "مقبول"
+        approved_state = "approved"
         
         # Execute batched queries
         # Strategy: If we have many cities (>10), query by department first, then filter by city in memory
@@ -241,7 +242,7 @@ def _fetch_eligible_clients(department_ids, cities, db):
         # Throw detailed exception if no clients found
         if len(unique_clients) == 0:
             # Fallback: Check what cities actually exist for the requested departments (with approved state)
-            approved_state = "مقبول"
+            approved_state = "approved"
             actual_cities_for_depts = set()
             try:
                 for i in range(0, min(len(department_ids_list), batch_size)):
@@ -266,7 +267,7 @@ def _fetch_eligible_clients(department_ids, cities, db):
             error_parts = ["No clients found matching the criteria"]
             error_parts.append(f"Requested departments: {department_ids_list}")
             error_parts.append(f"Requested cities: {cities_list}")
-            error_parts.append(f"Required state: مقبول (approved)")
+            error_parts.append(f"Required state: approved (approved)")
             
             if diagnostic_info["dept_mismatches"]:
                 error_parts.append(f"Department IDs not in database: {diagnostic_info['dept_mismatches']}")
@@ -285,7 +286,7 @@ def _fetch_eligible_clients(department_ids, cities, db):
             
             # Additional diagnostic: Check if any clients exist with the requested departments
             if diagnostic_info["department_matches"] == 0:
-                error_parts.append("No approved clients (مقبول) found with requested departments (even without city filter)")
+                error_parts.append("No approved clients (approved) found with requested departments (even without city filter)")
             
             # Show actual cities that exist for the requested departments
             if "actual_cities_for_departments" in diagnostic_info:
@@ -477,7 +478,7 @@ def create_plan_tasks(data, db):
     
     Matches the Dart implementation behavior:
     - Checks for existing tasks to avoid duplicates
-    - Only creates tasks for approved clients (state = "مقبول")
+    - Only creates tasks for approved clients (state = "approved")
     
     Args:
         data: Request data containing plan information
@@ -701,7 +702,7 @@ def create_tasks_for_new_client(data, db):
         }), 400
     
     # Only process approved clients
-    if client_state != "مقبول":
+    if client_state != "approved":
         return jsonify({
             "success": True,
             "message": "Client is not approved yet. No tasks created.",
@@ -916,7 +917,7 @@ def create_tasks_from_product(data, db):
     5. Gets all clients from clients collection where:
        - Client's department is in product's departmentsIds
        - Client's city is in plan's cities
-       - Client's state is "مقبول" (approved)
+       - Client's state is "approved" (approved)
     6. For each matching client:
        - Gets influencer doctors from client
        - Creates tasks for each doctor, product, and marketing task combination
@@ -1015,9 +1016,9 @@ def create_tasks_from_product(data, db):
         # Get all clients where:
         # - Client's department is in product's departmentsIds
         # - Client's city is in plan's cities
-        # - Client's state is "مقبول" (approved)
+        # - Client's state is "approved" (approved)
         eligible_clients = []
-        approved_state = "مقبول"
+        approved_state = "approved"
         
         try:
             # Query clients by department (handle Firebase whereIn limitation)
@@ -1199,5 +1200,240 @@ def create_tasks_from_product(data, db):
             "success": False,
             "planId": plan_id,
             "productId": product_id
+        }), 500
+
+
+
+def get_task_stats(decoded_token, db):
+    """Get task statistics aggregated by date.
+    
+    Query all tasks where user is a sales representative, group them by date, 
+    and return count for each date.
+    
+    Args:
+        decoded_token: Decoded Firebase Auth token
+        db: Firestore database instance
+        
+    Returns:
+        JSON response with list of stats: [{date: 'YYYY-MM-DD', count: N}, ...]
+    """
+    try:
+        uid = decoded_token.get("uid")
+        if not uid:
+            return jsonify({
+                "error": "User ID required",
+                "success": False
+            }), 400
+
+        # Query tasks where user is in salesRepresentativeIds
+        # We filter targetDate != None in memory to avoid complex composite index requirements
+        # with array-contains queries.
+        tasks_query = db.collection("tasks").where("salesRepresentativeIds", "array_contains", uid).stream()
+        
+        # Dictionary to store counts: date_str -> count
+        stats_map = {}
+        
+        for doc in tasks_query:
+            task = doc.to_dict()
+            target_date = task.get("targetDate")
+            
+            if not target_date:
+                continue
+                
+            # Parse date
+            date_key = None
+            
+            if isinstance(target_date, datetime):
+                # Format as YYYY-MM-DD
+                date_key = target_date.strftime("%Y-%m-%d")
+            elif isinstance(target_date, str):
+                # Try to parse string
+                try:
+                    # Handle ISO format variants
+                    if "T" in target_date:
+                        date_obj = datetime.fromisoformat(target_date.replace("Z", "+00:00"))
+                        date_key = date_obj.strftime("%Y-%m-%d")
+                    else:
+                        # Assume simple date string, maybe take first 10 chars
+                        date_key = target_date[:10]
+                except:
+                    # Fallback or ignore invalid formats
+                    continue
+            elif isinstance(target_date, int):
+                # Timestamp in milliseconds
+                try:
+                    date_obj = datetime.fromtimestamp(target_date / 1000.0)
+                    date_key = date_obj.strftime("%Y-%m-%d")
+                except:
+                    continue
+            
+            if date_key:
+                stats_map[date_key] = stats_map.get(date_key, 0) + 1
+        
+        # Convert map to list of objects
+        result = []
+        for date_str, count in stats_map.items():
+            result.append({
+                "date": date_str,
+                "count": count
+            })
+            
+        # Sort by date
+        result.sort(key=lambda x: x["date"])
+        
+        return jsonify({
+            "success": True,
+            "data": result
+        })
+        
+    except Exception as e:
+        print(f"Error getting task stats: {str(e)}")
+        # trace = traceback.format_exc()
+        # print(trace)
+        return jsonify({
+            "error": f"Failed to get stats: {str(e)}",
+            "success": False
+        }), 500
+
+
+def get_tasks_by_date_range(data, decoded_token, db):
+    """Get tasks within a specific date range.
+    
+    Args:
+        data: Request data containing 'date' (YYYY-MM-DD) and 'days' (int)
+        decoded_token: Decoded Firebase Auth token
+        db: Firestore database instance
+        
+    Returns:
+        JSON response with list of tasks
+    """
+    try:
+        uid = decoded_token.get("uid")
+        if not uid:
+            return jsonify({
+                "error": "User ID required",
+                "success": False
+            }), 400
+
+        start_date_str = data.get("date")
+        days = data.get("days")
+        
+        if not start_date_str:
+            return jsonify({
+                "error": "Start date is required",
+                "success": False
+            }), 400
+            
+        if days is None:
+            return jsonify({
+                "error": "Days count is required",
+                "success": False
+            }), 400
+
+        # Parse start date
+        try:
+            # Handle possible ISO format
+            if isinstance(start_date_str, str):
+                if "T" in start_date_str:
+                    start_date = datetime.fromisoformat(start_date_str.replace("Z", "+00:00"))
+                else:
+                    start_date = datetime.strptime(start_date_str, "%Y-%m-%d")
+            elif isinstance(start_date_str, datetime):
+                start_date = start_date_str
+            else:
+                raise ValueError("Invalid date format")
+                
+            # Normalize to start of day
+            start_date = start_date.replace(hour=0, minute=0, second=0, microsecond=0)
+            
+        except Exception:
+            return jsonify({
+                "error": "Invalid date format. Use YYYY-MM-DD",
+                "success": False
+            }), 400
+            
+        try:
+            days_count = int(days)
+        except ValueError:
+            return jsonify({
+                "error": "Days must be an integer",
+                "success": False
+            }), 400
+            
+        # Calculate end date (inclusive)
+        from datetime import timedelta
+        end_date = start_date + timedelta(days=days_count)
+        # Set end date to end of day to be inclusive
+        end_date = end_date.replace(hour=23, minute=59, second=59, microsecond=999999)
+        
+        # Query tasks where user is in salesRepresentativeIds
+        # We process targetDate filtering in memory to be safe against index requirements and data inconsistencies
+        
+        matching_tasks = []
+        
+        tasks_query = db.collection("tasks").where("salesRepresentativeIds", "array_contains", uid).where("targetDate", ">=", start_date).where("targetDate", "<=", end_date).stream()
+        for doc in tasks_query:
+            task = doc.to_dict()
+            task["id"] = doc.id
+            target_date_raw = task.get("targetDate")
+            
+            # Strict check for valid data
+            if target_date_raw is None:
+                continue
+                
+            if isinstance(target_date_raw, str) and not target_date_raw.strip():
+                continue
+                
+            # Parse target date
+            task_date = None
+            try:
+                if isinstance(target_date_raw, datetime):
+                    task_date = target_date_raw
+                elif isinstance(target_date_raw, str):
+                    if "T" in target_date_raw:
+                        task_date = datetime.fromisoformat(target_date_raw.replace("Z", "+00:00"))
+                    else:
+                        task_date = datetime.strptime(target_date_raw[:10], "%Y-%m-%d")
+                elif isinstance(target_date_raw, int):
+                    task_date = datetime.fromtimestamp(target_date_raw / 1000.0)
+            except:
+                continue
+                
+            if not task_date:
+                continue
+                
+            # Remove timezone info for comparison if needed
+            if task_date.tzinfo and not start_date.tzinfo:
+                 task_date = task_date.replace(tzinfo=None)
+            
+            # Check if date is within range
+            if start_date <= task_date <= end_date:
+                matching_tasks.append(task)
+        
+        # Sort by target date
+        def get_sort_key(t):
+             d = t.get("targetDate")
+             # Helper to make sort key comparable
+             if isinstance(d, str): return d
+             if isinstance(d, datetime): return d.isoformat()
+             return str(d)
+
+        matching_tasks.sort(key=get_sort_key)
+        
+        return jsonify({
+            "success": True,
+            "data": matching_tasks,
+            "count": len(matching_tasks),
+            "dateRange": {
+                "start": start_date.isoformat(),
+                "end": end_date.isoformat()
+            }
+        })
+        
+    except Exception as e:
+        print(f"Error getting tasks in range: {str(e)}")
+        return jsonify({
+            "error": f"Failed to get tasks: {str(e)}",
+            "success": False
         }), 500
 

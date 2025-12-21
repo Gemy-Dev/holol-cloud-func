@@ -20,7 +20,7 @@ When a new client is created (or approved), this endpoint automatically creates 
 
 ## Prerequisites
 
-- Client must be **approved** (`state == "مقبول"`)
+- Client must be **approved** (`state == "approved"`)
 - Client must have **influencer doctors** in `additionalInfo.doctors` where `isInfluencer == true`
 - Matching plans must exist with products that have marketing tasks
 
@@ -40,7 +40,7 @@ POST https://your-cloud-function-url/app
     "name": "Client Name",
     "city": "بغداد",
     "department": "dept_id",
-    "state": "مقبول",
+    "state": "approved",
     "clientType": "hospital",
     "sectorType": "private",
     "region": "Iraq",
@@ -287,7 +287,7 @@ curl -X POST https://your-cloud-function-url/app \
       "name": "Test Hospital",
       "city": "بغداد",
       "department": "dept_id",
-      "state": "مقبول",
+      "state": "approved",
       "additionalInfo": {
         "doctors": [
           {
