@@ -450,7 +450,7 @@ def _create_doctor_task(plan_id, plan_data, client, product, marketing_task, doc
             "productId": product["id"],
             "status": "قيد الانجاز",  # Default status (TaskStatus enum)
             "cancelReason": None,  # Optional
-            "state": "قيد المراجعة",  # Default review state (ReviewState enum)
+            "state": "approved",  # Default review state (ReviewState enum)
             "visitResult": None,  # Optional
             "priority": priority_name,
             "note": None,  # Optional
