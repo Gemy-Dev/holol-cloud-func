@@ -8,7 +8,7 @@ from datetime import datetime
 import os
 
 # Import modules
-from modules.auth import verify_token, reset_password
+from modules.auth import verify_token, reset_password, set_password
 from modules.users import create_user, update_user, delete_user
 from modules.products import get_products, get_plan_products, get_clients, delete_client_and_tasks
 from modules.tasks import create_plan_tasks, create_tasks_for_new_client, create_tasks_from_product, get_task_stats, get_tasks_by_date_range
@@ -162,6 +162,8 @@ def route_request(action, data, request):
     elif action == "resetPassword":
         return reset_password(data, decoded_token)
     
+    elif action == "setPassword":
+        return set_password(data, decoded_token)
     elif action == "sendEmail":
         title = data.get("title")
         body = data.get("body")

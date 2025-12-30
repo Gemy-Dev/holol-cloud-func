@@ -252,8 +252,6 @@ Future<void> approveClient(ClientModel client) async {
 
 2. **Task Structure**: Tasks are created with:
    - `taskType`: "planned"
-   - `salesRepresentativeIds`: From plan
-   - `salesManagerId`: From plan
    - `assignedToId`: First sales representative from plan
    - `planId`: The matching plan ID
    - `clientId`: The new client's ID

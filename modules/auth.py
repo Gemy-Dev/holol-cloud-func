@@ -58,3 +58,40 @@ def reset_password(data, decoded_token):
         error_msg = f"Failed to reset password: {str(e)}"
         return jsonify({"error": error_msg}), 500
 
+
+def set_password(data, decoded_token):
+    """Set a user's password directly.
+
+    Args:
+        data: Request data containing 'uid' and 'password'
+        decoded_token: Decoded Firebase Auth token (for authorization)
+
+    Returns:
+        JSON response indicating success or error
+    """
+    uid = data.get("uid")
+    password = data.get("password")
+
+    if not uid or not password:
+        return jsonify({"error": "Both 'uid' and 'password' are required"}), 400
+
+    # Authorization: allow if requester is the same user or has an 'admin' claim
+    requester_uid = decoded_token.get("uid") or decoded_token.get("user_id")
+    is_admin = decoded_token.get("admin") or decoded_token.get("isAdmin") or False
+
+    if requester_uid != uid and not is_admin:
+        return jsonify({"error": "Not authorized to change this user's password"}), 403
+
+    try:
+        user = auth.update_user(uid, password=password)
+        return jsonify({
+            "success": True,
+            "message": "Password updated successfully",
+            "uid": user.uid,
+            "email": user.email,
+        }), 200
+    except auth.UserNotFoundError:
+        return jsonify({"error": "User not found"}), 404
+    except Exception as e:
+        return jsonify({"error": f"Failed to set password: {str(e)}"}), 500
+

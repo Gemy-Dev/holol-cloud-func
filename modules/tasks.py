@@ -422,13 +422,6 @@ def _create_doctor_task(plan_id, plan_data, client, product, marketing_task, doc
         if list(existing_query):
             return False
         
-        # Get salesRepresentativeIds and salesManagerId from plan
-        sales_representative_ids = plan_data.get("salesRepresentativeIds", [])
-        sales_manager_id = plan_data.get("salesManagerId", "")
-        
-        # assignedToId - typically the first sales representative or empty
-        assigned_to_id = sales_representative_ids[0] if sales_representative_ids else ""
-        
         # Get priority from client (handle both enum name and value)
         client_priority = client.get("priority")
         if isinstance(client_priority, dict):
@@ -441,9 +434,7 @@ def _create_doctor_task(plan_id, plan_data, client, product, marketing_task, doc
         # Create new task matching Flutter TaskModel structure with doctor info
         task_data = {
             "taskType": "planned",  # TaskType.planned.value
-            "salesRepresentativeIds": sales_representative_ids,
-            "salesManagerId": sales_manager_id,
-            "assignedToId": assigned_to_id,
+            "assignedToId": None,
             "planId": plan_id,
             "clientId": client["id"],
             "targetDate": None,  # Optional, can be set later
@@ -1225,10 +1216,10 @@ def get_task_stats(decoded_token, db):
                 "success": False
             }), 400
 
-        # Query tasks where user is in salesRepresentativeIds
+        # Query tasks where user is assigned to
         # We filter targetDate != None in memory to avoid complex composite index requirements
         # with array-contains queries.
-        tasks_query = db.collection("tasks").where("salesRepresentativeIds", "array_contains", uid).stream()
+        tasks_query = db.collection("tasks").where("assignedToId", "==", uid).stream()
         
         # Dictionary to store counts: date_str -> count
         stats_map = {}
@@ -1366,12 +1357,12 @@ def get_tasks_by_date_range(data, decoded_token, db):
         # Set end date to end of day to be inclusive
         end_date = end_date.replace(hour=23, minute=59, second=59, microsecond=999999)
         
-        # Query tasks where user is in salesRepresentativeIds
+        # Query tasks where user is assigned to
         # We process targetDate filtering in memory to be safe against index requirements and data inconsistencies
         
         matching_tasks = []
         
-        tasks_query = db.collection("tasks").where("salesRepresentativeIds", "array_contains", uid).where("targetDate", ">=", start_date).where("targetDate", "<=", end_date).stream()
+        tasks_query = db.collection("tasks").where("assignedToId", "==", uid).where("targetDate", ">=", start_date).where("targetDate", "<=", end_date).stream()
         for doc in tasks_query:
             task = doc.to_dict()
             task["id"] = doc.id
