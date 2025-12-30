@@ -6,11 +6,11 @@ from datetime import datetime
 
 
 def handle_daily_notifications(db):
-    """Handle daily notification tasks"""
+    """Handle task notifications (runs every 10 minutes)"""
     try:
         # Get today's date for user stats
         today = datetime.utcnow().date().isoformat()
-        print(f"🔔 Running daily notifications for: {today}")
+        print(f"🔔 Running task notifications for: {today}")
 
         users_ref = db.collection("users").stream()
         notification_count = 0
@@ -21,34 +21,59 @@ def handle_daily_notifications(db):
             if not fcm_token:
                 continue
 
-            tasks_ref = db.collection("tasks").where("salesRepresentativeId", "==", user_doc.id).stream()
+            # Collect all tasks for this user that are due today
+            tasks_ref = db.collection("tasks").where("assignedToId", "==", user_doc.id).stream()
+            today_tasks = []
+            
             for task_doc in tasks_ref:
                 task = task_doc.to_dict()
                 task_date = task.get("targetDate")
                 if task_date == today:
-                    message = messaging.Message(
-                        token=fcm_token,
-                        notification=messaging.Notification(
-                            title="تذكير بالمهام",
-                            body=f"عندك اليوم مهمة: {task.get('title', 'بدون عنوان')}"
-                        )
-                    )
-                    try:
-                        response = messaging.send(message)
-                        notification_count += 1
-                        print(f"✅ Sent to {user_doc.id}: {response}")
-                    except Exception as e:
-                        print(f"❌ Error sending to {user_doc.id}: {str(e)}")
+                    today_tasks.append({
+                        "id": task_doc.id,
+                        "title": task.get("title", "بدون عنوان")
+                    })
+            
+            # Send notification only if there are tasks due today
+            if today_tasks:
+                task_count = len(today_tasks)
+                task_ids = [task["id"] for task in today_tasks]
+                
+                # Create notification body
+                if task_count == 1:
+                    body = f"عندك اليوم مهمة: {today_tasks[0]['title']}"
+                else:
+                    body = f"عندك اليوم {task_count} مهام"
+                
+                message = messaging.Message(
+                    token=fcm_token,
+                    notification=messaging.Notification(
+                        title="تذكير بالمهام",
+                        body=body
+                    ),
+                    data={
+                        "taskCount": str(task_count),
+                        "taskIds": ",".join(task_ids),
+                        "date": today,
+                        "action": "daily_tasks"
+                    }
+                )
+                try:
+                    response = messaging.send(message)
+                    notification_count += 1
+                    print(f"✅ Sent to {user_doc.id}: {task_count} tasks, IDs: {task_ids}")
+                except Exception as e:
+                    print(f"❌ Error sending to {user_doc.id}: {str(e)}")
         
         return jsonify({
             "success": True, 
-            "message": f"Daily task completed. Sent {notification_count} notifications.",
+            "message": f"Task notifications completed. Sent {notification_count} notifications.",
             "date": today,
             "count": notification_count
         })
         
     except Exception as e:
-        error_msg = f"Error in daily task: {str(e)}"
+        error_msg = f"Error in task notifications: {str(e)}"
         print(error_msg)
         print(traceback.format_exc())
         return jsonify({"error": error_msg}), 500

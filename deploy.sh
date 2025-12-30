@@ -148,11 +148,11 @@ setup_schedulers() {
     
     echo "🔗 App Function URL: $FUNCTION_URL"
     
-    # Setup daily notifications scheduler
+    # Setup task notifications scheduler (every 10 minutes)
     if gcloud scheduler jobs describe daily-notifications --location=$REGION --project=$PROJECT_ID &>/dev/null; then
-        echo "📝 Updating daily notifications scheduler..."
+        echo "📝 Updating task notifications scheduler..."
         gcloud scheduler jobs update http daily-notifications \
-            --schedule="0 5 * * *" \
+            --schedule="*/10 * * * *" \
             --uri="$FUNCTION_URL" \
             --http-method=POST \
             --message-body='{"action":"daily_notifications"}' \
@@ -160,15 +160,15 @@ setup_schedulers() {
             --location=$REGION \
             --project=$PROJECT_ID
     else
-        echo "🆕 Creating daily notifications scheduler..."
+        echo "🆕 Creating task notifications scheduler..."
         gcloud scheduler jobs create http daily-notifications \
-            --schedule="0 5 * * *" \
+            --schedule="*/10 * * * *" \
             --uri="$FUNCTION_URL" \
             --http-method=POST \
             --message-body='{"action":"daily_notifications"}' \
             --time-zone="UTC" \
             --location=$REGION \
-            --description="Daily task notifications" \
+            --description="Task notifications every 10 minutes" \
             --project=$PROJECT_ID
     fi
     
