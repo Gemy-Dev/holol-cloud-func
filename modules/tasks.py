@@ -1362,14 +1362,15 @@ def get_tasks_by_date_range(data, decoded_token, db):
         
         matching_tasks = []
         
-        tasks_query = db.collection("tasks").where("assignedToId", "==", uid).where("targetDate", ">=", start_date).where("targetDate", "<=", end_date).stream()
+        # Query only by assignedToId, filter by date range in memory to handle null/inconsistent data
+        tasks_query = db.collection("tasks").where("assignedToId", "==", uid).stream()
         for doc in tasks_query:
             task = doc.to_dict()
             task["id"] = doc.id
             target_date_raw = task.get("targetDate")
             
             # Strict check for valid data
-            if target_date_raw is None:
+            if target_date_raw is None :
                 continue
                 
             if isinstance(target_date_raw, str) and not target_date_raw.strip():

@@ -80,7 +80,7 @@ def route_request(action, data, request):
     # Scheduled notifications (no auth needed)
     if action == "daily_notifications":
         return handle_daily_notifications(db)
-    
+  
     # API actions (auth required)
     decoded_token, error, status = verify_token(request)
     if error:

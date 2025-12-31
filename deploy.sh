@@ -172,6 +172,30 @@ setup_schedulers() {
             --project=$PROJECT_ID
     fi
     
+    # Setup test notifications scheduler (every 1 minute - FOR TESTING ONLY)
+    if gcloud scheduler jobs describe test-notifications --location=$REGION --project=$PROJECT_ID &>/dev/null; then
+        echo "📝 Updating test notifications scheduler..."
+        gcloud scheduler jobs update http test-notifications \
+            --schedule="* * * * *" \
+            --uri="$FUNCTION_URL" \
+            --http-method=POST \
+            --message-body='{"action":"test_notification_to_all"}' \
+            --time-zone="UTC" \
+            --location=$REGION \
+            --project=$PROJECT_ID
+    else
+        echo "🆕 Creating test notifications scheduler..."
+        gcloud scheduler jobs create http test-notifications \
+            --schedule="* * * * *" \
+            --uri="$FUNCTION_URL" \
+            --http-method=POST \
+            --message-body='{"action":"test_notification_to_all"}' \
+            --time-zone="UTC" \
+            --location=$REGION \
+            --description="Test notifications every minute (FOR TESTING ONLY)" \
+            --project=$PROJECT_ID
+    fi
+    
     return $?
 }
 

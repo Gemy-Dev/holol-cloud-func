@@ -2,7 +2,137 @@
 from firebase_admin import messaging
 from flask import jsonify
 import traceback
-from datetime import datetime
+from datetime import datetime, date, timezone, timedelta
+from email.utils import parsedate_to_datetime
+import random
+
+
+def _normalize_target_date(value):
+    """Normalize various targetDate representations to an ISO date string (YYYY-MM-DD).
+
+    Supports:
+    - datetime.date / datetime.datetime
+    - dict with 'seconds' and 'nanoseconds' (Firestore REST style)
+    - objects with 'seconds' and 'nanos' attributes (protobuf Timestamp)
+    - int/float UNIX timestamps (seconds or milliseconds)
+    - common string formats (ISO, RFC-2822, 'YYYY-MM-DD HH:MM:SS', 'dd/mm/yyyy', 'mm/dd/yyyy', 'Jan 1, 2026', ...)
+    Returns ISO date string or None if unable to parse.
+    """
+    if value is None:
+        return None
+
+    try:
+        # datetime / date
+        if isinstance(value, datetime):
+            dt = value
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            else:
+                dt = dt.astimezone(timezone.utc)
+            return dt.date().isoformat()
+
+        if isinstance(value, date):
+            return value.isoformat()
+
+        # dict-like from REST: {'seconds': ..., 'nanoseconds': ...}
+        if isinstance(value, dict):
+            secs = value.get('seconds') or value.get('sec') or value.get('s')
+            nanos = value.get('nanoseconds') or value.get('nanos') or value.get('ns') or 0
+            if secs is not None:
+                ts = float(secs) + float(nanos) / 1e9
+                dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+                return dt.date().isoformat()
+
+        # protobuf-like Timestamp object
+        if hasattr(value, 'seconds') and hasattr(value, 'nanos'):
+            try:
+                secs = float(getattr(value, 'seconds'))
+                nanos = float(getattr(value, 'nanos'))
+                ts = secs + nanos / 1e9
+                dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+                return dt.date().isoformat()
+            except Exception:
+                pass
+
+        # numeric timestamp (seconds or milliseconds)
+        if isinstance(value, (int, float)):
+            v = float(value)
+            if v > 1e12:  # milliseconds
+                v = v / 1000.0
+            dt = datetime.fromtimestamp(v, tz=timezone.utc)
+            return dt.date().isoformat()
+
+        # string parsing
+        if isinstance(value, str):
+            s = value.strip()
+            if not s:
+                return None
+
+            # ISO-like with trailing Z -> fromisoformat requires replacing Z
+            try:
+                iso = s.replace('Z', '+00:00') if s.endswith('Z') else s
+                dt = datetime.fromisoformat(iso)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                else:
+                    dt = dt.astimezone(timezone.utc)
+                return dt.date().isoformat()
+            except Exception:
+                pass
+
+            # RFC-2822 / HTTP-date
+            try:
+                dt = parsedate_to_datetime(s)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                else:
+                    dt = dt.astimezone(timezone.utc)
+                return dt.date().isoformat()
+            except Exception:
+                pass
+
+            # numeric string timestamp
+            if s.isdigit():
+                try:
+                    v = float(s)
+                    if v > 1e12:
+                        v = v / 1000.0
+                    dt = datetime.fromtimestamp(v, tz=timezone.utc)
+                    return dt.date().isoformat()
+                except Exception:
+                    pass
+
+            # try common human formats
+            for fmt in (
+                "%Y-%m-%d %H:%M:%S.%f",
+                "%Y-%m-%d %H:%M:%S",
+                "%Y-%m-%d",
+                "%d/%m/%Y",
+                "%m/%d/%Y",
+                "%b %d, %Y",
+                "%B %d, %Y",
+            ):
+                try:
+                    dt = datetime.strptime(s, fmt)
+                    dt = dt.replace(tzinfo=timezone.utc)
+                    return dt.date().isoformat()
+                except Exception:
+                    continue
+
+            # last resort: try fromisoformat again
+            try:
+                dt = datetime.fromisoformat(s)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                else:
+                    dt = dt.astimezone(timezone.utc)
+                return dt.date().isoformat()
+            except Exception:
+                return None
+
+        return None
+    except Exception:
+        return None
 
 
 def handle_daily_notifications(db):
@@ -28,7 +158,10 @@ def handle_daily_notifications(db):
             for task_doc in tasks_ref:
                 task = task_doc.to_dict()
                 task_date = task.get("targetDate")
-                if task_date == today:
+
+                # Normalize various date formats to ISO date string (YYYY-MM-DD)
+                normalized = _normalize_target_date(task_date)
+                if normalized == today:
                     today_tasks.append({
                         "id": task_doc.id,
                         "title": task.get("title", "بدون عنوان")
@@ -76,7 +209,7 @@ def handle_daily_notifications(db):
         error_msg = f"Error in task notifications: {str(e)}"
         print(error_msg)
         print(traceback.format_exc())
-        return jsonify({"error": error_msg}), 500
+        return jsonify({"error": error_msg        }), 500
 
 
 def handle_send_notification(decoded_token, data, db):
