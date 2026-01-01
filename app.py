@@ -80,6 +80,14 @@ def route_request(action, data, request):
     # Scheduled notifications (no auth needed)
     if action == "daily_notifications":
         return handle_daily_notifications(db)
+    
+    # 8 AM Iraq time - send today's tasks
+    elif action == "notify_today_tasks":
+        return handle_daily_notifications(db, days_offset=0)
+    
+    # 8 PM Iraq time - send tomorrow's tasks  
+    elif action == "notify_tomorrow_tasks":
+        return handle_daily_notifications(db, days_offset=1)
   
     # API actions (auth required)
     decoded_token, error, status = verify_token(request)

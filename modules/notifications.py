@@ -135,12 +135,24 @@ def _normalize_target_date(value):
         return None
 
 
-def handle_daily_notifications(db):
-    """Handle task notifications (runs every 10 minutes)"""
+def handle_daily_notifications(db, days_offset=0):
+    """Handle task notifications for a specific date.
+    
+    Args:
+        db: Firestore database instance
+        days_offset: Days from today (0=today, 1=tomorrow, etc.)
+    
+    Used by Cloud Scheduler:
+    - 8 AM Iraq time (UTC+3): days_offset=0 (today's tasks)
+    - 8 PM Iraq time (UTC+3): days_offset=1 (tomorrow's tasks)
+    """
     try:
-        # Get today's date for user stats
-        today = datetime.utcnow().date().isoformat()
-        print(f"🔔 Running task notifications for: {today}")
+        # Calculate target date in Iraq time (UTC+3)
+        iraq_tz_offset = timedelta(hours=3)
+        iraq_now = datetime.utcnow() + iraq_tz_offset
+        target_date = (iraq_now.date() + timedelta(days=days_offset)).isoformat()
+        
+        print(f"🔔 Running task notifications for date: {target_date} (offset: {days_offset})")
 
         users_ref = db.collection("users").stream()
         notification_count = 0
@@ -151,7 +163,7 @@ def handle_daily_notifications(db):
             if not fcm_token:
                 continue
 
-            # Collect all tasks for this user that are due today
+            # Collect all tasks for this user that are due on target date
             tasks_ref = db.collection("tasks").where("assignedToId", "==", user_doc.id).stream()
             today_tasks = []
             
@@ -161,22 +173,30 @@ def handle_daily_notifications(db):
 
                 # Normalize various date formats to ISO date string (YYYY-MM-DD)
                 normalized = _normalize_target_date(task_date)
-                if normalized == today:
+                if normalized == target_date:
                     today_tasks.append({
                         "id": task_doc.id,
                         "title": task.get("title", "بدون عنوان")
                     })
             
-            # Send notification only if there are tasks due today
+            # Send notification only if there are tasks due on target date
             if today_tasks:
                 task_count = len(today_tasks)
                 task_ids = [task["id"] for task in today_tasks]
                 
-                # Create notification body
-                if task_count == 1:
-                    body = f"عندك اليوم مهمة: {today_tasks[0]['title']}"
+                # Create notification body based on offset
+                if days_offset == 0:
+                    # Today's tasks
+                    if task_count == 1:
+                        body = f"عندك اليوم مهمة: {today_tasks[0]['title']}"
+                    else:
+                        body = f"عندك اليوم {task_count} مهام"
                 else:
-                    body = f"عندك اليوم {task_count} مهام"
+                    # Tomorrow's tasks
+                    if task_count == 1:
+                        body = f"عندك غدا مهمة: {today_tasks[0]['title']}"
+                    else:
+                        body = f"عندك غدا {task_count} مهام"
                 
                 message = messaging.Message(
                     token=fcm_token,
@@ -187,7 +207,7 @@ def handle_daily_notifications(db):
                     data={
                         "taskCount": str(task_count),
                         "taskIds": ",".join(task_ids),
-                        "date": today,
+                        "date": target_date,
                         "action": "daily_tasks"
                     }
                 )
@@ -201,7 +221,8 @@ def handle_daily_notifications(db):
         return jsonify({
             "success": True, 
             "message": f"Task notifications completed. Sent {notification_count} notifications.",
-            "date": today,
+            "date": target_date,
+            "offset": days_offset,
             "count": notification_count
         })
         
