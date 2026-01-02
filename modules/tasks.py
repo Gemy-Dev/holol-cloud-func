@@ -1287,6 +1287,89 @@ def get_task_stats(decoded_token, db):
         }), 500
 
 
+def get_all_tasks_stats(db):
+    """Get statistics for ALL tasks aggregated by date.
+    
+    Query all tasks in the system, group them by date, 
+    and return count for each date. This is an admin function.
+    
+    Args:
+        db: Firestore database instance
+        
+    Returns:
+        JSON response with list of stats: [{date: 'YYYY-MM-DD', count: N}, ...]
+    """
+    try:
+        # Query ALL tasks (no user filter)
+        # We filter targetDate != None in memory to avoid complex composite index requirements
+        tasks_query = db.collection("tasks").stream()
+        
+        # Dictionary to store counts: date_str -> count
+        stats_map = {}
+        
+        for doc in tasks_query:
+            task = doc.to_dict()
+            target_date = task.get("targetDate")
+            
+            if not target_date:
+                continue
+                
+            # Parse date
+            date_key = None
+            
+            if isinstance(target_date, datetime):
+                # Format as YYYY-MM-DD
+                date_key = target_date.strftime("%Y-%m-%d")
+            elif isinstance(target_date, str):
+                # Try to parse string
+                try:
+                    # Handle ISO format variants
+                    if "T" in target_date:
+                        date_obj = datetime.fromisoformat(target_date.replace("Z", "+00:00"))
+                        date_key = date_obj.strftime("%Y-%m-%d")
+                    else:
+                        # Assume simple date string, maybe take first 10 chars
+                        date_key = target_date[:10]
+                except:
+                    # Fallback or ignore invalid formats
+                    continue
+            elif isinstance(target_date, int):
+                # Timestamp in milliseconds
+                try:
+                    date_obj = datetime.fromtimestamp(target_date / 1000.0)
+                    date_key = date_obj.strftime("%Y-%m-%d")
+                except:
+                    continue
+            
+            if date_key:
+                stats_map[date_key] = stats_map.get(date_key, 0) + 1
+        
+        # Convert map to list of objects
+        result = []
+        for date_str, count in stats_map.items():
+            result.append({
+                "date": date_str,
+                "count": count
+            })
+            
+        # Sort by date
+        result.sort(key=lambda x: x["date"])
+        
+        return jsonify({
+            "success": True,
+            "data": result
+        })
+        
+    except Exception as e:
+        print(f"Error getting all tasks stats: {str(e)}")
+        # trace = traceback.format_exc()
+        # print(trace)
+        return jsonify({
+            "error": f"Failed to get stats: {str(e)}",
+            "success": False
+        }), 500
+
+
 def get_tasks_by_date_range(data, decoded_token, db):
     """Get tasks within a specific date range.
     

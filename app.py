@@ -11,7 +11,14 @@ import os
 from modules.auth import verify_token, reset_password, set_password
 from modules.users import create_user, update_user, delete_user
 from modules.products import get_products, get_plan_products, get_clients, delete_client_and_tasks
-from modules.tasks import create_plan_tasks, create_tasks_for_new_client, create_tasks_from_product, get_task_stats, get_tasks_by_date_range
+from modules.tasks import (
+    create_plan_tasks, 
+    create_tasks_for_new_client, 
+    create_tasks_from_product, 
+    get_task_stats, 
+    get_all_tasks_stats,
+    get_tasks_by_date_range
+)
 from modules.backups import (
     handle_manual_backup,
     handle_backup_status,
@@ -88,6 +95,10 @@ def route_request(action, data, request):
     # 8 PM Iraq time - send tomorrow's tasks  
     elif action == "notify_tomorrow_tasks":
         return handle_daily_notifications(db, days_offset=1)
+    
+    # Get all tasks stats (no auth required - for admin use)
+    elif action == "getAllTasksStats":
+        return get_all_tasks_stats(db)
   
     # API actions (auth required)
     decoded_token, error, status = verify_token(request)
