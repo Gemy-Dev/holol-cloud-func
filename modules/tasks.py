@@ -441,7 +441,7 @@ def _create_doctor_task(plan_id, plan_data, client, product, marketing_task, doc
             "productId": product["id"],
             "status": "قيد الانجاز",  # Default status (TaskStatus enum)
             "cancelReason": None,  # Optional
-            "state": "approved",  # Default review state (ReviewState enum)
+            "reviewState": "approved",  # Default review state (ReviewState enum)
             "visitResult": None,  # Optional
             "priority": priority_name,
             "note": None,  # Optional
@@ -469,7 +469,7 @@ def create_plan_tasks(data, db):
     
     Matches the Dart implementation behavior:
     - Checks for existing tasks to avoid duplicates
-    - Only creates tasks for approved clients (state = "approved")
+    - Only creates tasks for approved clients (reviewState = "approved")
     
     Args:
         data: Request data containing plan information
@@ -1217,18 +1217,18 @@ def get_task_stats(decoded_token, db):
             }), 400
 
         # Query tasks where user is assigned to
-        # We filter targetDate != None in memory to avoid complex composite index requirements
-        # with array-contains queries.
-        tasks_query = db.collection("tasks").where("assignedToId", "==", uid).stream()
-        
+        # We filter targetDate != None and reviewState != deleted in memory to avoid complex composite index requirements
+        tasks_query = db.collection("tasks").where("reviewState", "!=", "deleted").stream()
+
         # Dictionary to store counts: date_str -> count
         stats_map = {}
-        
+
         for doc in tasks_query:
             task = doc.to_dict()
             target_date = task.get("targetDate")
-            
-            if not target_date:
+            reviewState = task.get("reviewState")
+
+            if not target_date or reviewState == "deleted":
                 continue
                 
             # Parse date
@@ -1310,8 +1310,9 @@ def get_all_tasks_stats(db):
         for doc in tasks_query:
             task = doc.to_dict()
             target_date = task.get("targetDate")
-            
-            if not target_date:
+          
+
+            if not target_date :
                 continue
                 
             # Parse date
@@ -1446,12 +1447,13 @@ def get_tasks_by_date_range(data, decoded_token, db):
         matching_tasks = []
         
         # Query only by assignedToId, filter by date range in memory to handle null/inconsistent data
-        tasks_query = db.collection("tasks").where("assignedToId", "==", uid).stream()
+        tasks_query = db.collection("tasks").where("reviewState", "!=", "deleted").stream()
         for doc in tasks_query:
             task = doc.to_dict()
             task["id"] = doc.id
             target_date_raw = task.get("targetDate")
-            
+
+
             # Strict check for valid data
             if target_date_raw is None :
                 continue

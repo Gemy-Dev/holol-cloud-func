@@ -164,7 +164,7 @@ def handle_daily_notifications(db, days_offset=0):
                 continue
 
             # Collect all tasks for this user that are due on target date
-            tasks_ref = db.collection("tasks").where("assignedToId", "==", user_doc.id).stream()
+            tasks_ref = db.collection("tasks").stream()
             today_tasks = []
             
             for task_doc in tasks_ref:
