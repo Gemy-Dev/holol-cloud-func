@@ -3,7 +3,7 @@ import os
 
 BACKUP_BUCKET = "medical-advisor-bd734-backups"
 COLLECTIONS_TO_BACKUP = [
-    "users", "products","deals", "clients", "tasks", "plans", 
+    "users", "products","deals", "clients", "tasks", "plans","main_opportunities", 
     "departments", "specialties", "procedures", "companies",
     "notifications", "reports", "analytics","manufacturers","opportunities"
 ]

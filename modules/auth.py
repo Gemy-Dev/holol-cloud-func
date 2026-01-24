@@ -59,7 +59,7 @@ def reset_password(data, decoded_token):
         return jsonify({"error": error_msg}), 500
 
 
-def set_password(data, decoded_token):
+def set_password(data, decoded_token, db):
     """Set a user's password directly.
 
     Args:
@@ -76,8 +76,20 @@ def set_password(data, decoded_token):
         return jsonify({"error": "Both 'uid' and 'password' are required"}), 400
 
     # Authorization: allow if requester is the same user or has an 'admin' claim
+    # Authorization: allow if requester is the same user or has an 'admin' role
     requester_uid = decoded_token.get("uid") or decoded_token.get("user_id")
-    is_admin = decoded_token.get("admin") or decoded_token.get("isAdmin") or False
+    
+    is_admin = False
+    if requester_uid:
+        try:
+            requester_doc = db.collection("users").document(requester_uid).get()
+            if requester_doc.exists:
+                requester_data = requester_doc.to_dict()
+                if requester_data.get("role") == "admin":
+                    is_admin = True
+        except Exception:
+            # If we can't check role, assume not admin
+            pass
 
     if requester_uid != uid and not is_admin:
         return jsonify({"error": "Not authorized to change this user's password"}), 403

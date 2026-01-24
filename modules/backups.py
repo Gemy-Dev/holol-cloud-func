@@ -291,6 +291,123 @@ def handle_list_backups(decoded_token):
         }), 500
 
 
+def handle_delete_backup(decoded_token, data, db):
+    """Delete a backup from Cloud Storage by timestamp.
+
+    Args:
+        decoded_token: Decoded Firebase Auth token (for authorization)
+        data: Dict containing:
+            - backup_timestamp or timestamp: The backup timestamp to delete (format: YYYYMMDD_HHMMSS)
+        db: Firestore database instance
+
+    Returns:
+        JSON response with deletion status
+    """
+    try:
+        # Verify admin role
+        uid = decoded_token.get("uid") or decoded_token.get("user_id")
+        if not uid:
+            return jsonify({"error": "Invalid token"}), 403
+
+        user_doc = db.collection("users").document(uid).get()
+        if not user_doc.exists:
+            return jsonify({"error": "User not found"}), 404
+
+        user_data = user_doc.to_dict()
+        if user_data.get("role") != "admin":
+            return jsonify({"error": "Only admins can delete backups"}), 403
+
+        backup_timestamp = (
+            data.get("backup_timestamp")
+            or data.get("timestamp")
+            or data.get("backupTimestamp")
+        )
+
+        if not backup_timestamp:
+            return jsonify({
+                "success": False,
+                "error": "backup_timestamp is required"
+            }), 400
+
+        # Validate timestamp format
+        try:
+            datetime.strptime(backup_timestamp, '%Y%m%d_%H%M%S')
+        except ValueError:
+            return jsonify({
+                "success": False,
+                "error": f"Invalid timestamp format: {backup_timestamp}. Expected format: YYYYMMDD_HHMMSS"
+            }), 400
+
+        storage_client = storage.Client()
+        bucket = storage_client.bucket(BACKUP_BUCKET)
+
+        # Get all blobs with this backup timestamp prefix
+        prefix = f"firestore-backups/{backup_timestamp}/"
+        blobs = list(bucket.list_blobs(prefix=prefix))
+
+        if not blobs:
+            return jsonify({
+                "success": False,
+                "error": f"No backup found for timestamp {backup_timestamp}"
+            }), 404
+
+        # Track deletion stats
+        deleted_count = 0
+        deleted_size = 0
+        errors = []
+
+        print(f"🗑️ Starting deletion of backup: {backup_timestamp}")
+        print(f"📁 Found {len(blobs)} files to delete")
+
+        # Delete all backup files
+        for blob in blobs:
+            try:
+                file_size = blob.size or 0
+                blob.delete()
+                deleted_count += 1
+                deleted_size += file_size
+                print(f"  ✓ Deleted: {blob.name}")
+            except Exception as e:
+                error_msg = f"Failed to delete {blob.name}: {str(e)}"
+                errors.append(error_msg)
+                print(f"  ✗ {error_msg}")
+
+        # Also try to delete the archive if it exists
+        archive_blob_name = f"firestore-backups-archives/{backup_timestamp}.zip"
+        archive_blob = bucket.blob(archive_blob_name)
+        try:
+            if archive_blob.exists():
+                archive_size = archive_blob.size or 0
+                archive_blob.delete()
+                deleted_count += 1
+                deleted_size += archive_size
+                print(f"  ✓ Deleted archive: {archive_blob_name}")
+        except Exception as e:
+            # Archive may not exist, that's okay
+            print(f"  ⚠️ Archive not found or already deleted: {archive_blob_name}")
+
+        print(f"✅ Backup deletion completed: {deleted_count} files, {round(deleted_size / (1024 * 1024), 2)} MB")
+
+        return jsonify({
+            "success": True,
+            "message": f"Backup {backup_timestamp} deleted successfully",
+            "deleted_files": deleted_count,
+            "deleted_size_mb": round(deleted_size / (1024 * 1024), 2),
+            "errors": errors if errors else [],
+            "timestamp": get_iraq_time().isoformat()
+        })
+
+    except Exception as e:
+        error_msg = f"Failed to delete backup: {str(e)}"
+        print(f"❌ {error_msg}")
+        print(traceback.format_exc())
+        return jsonify({
+            "success": False,
+            "error": error_msg,
+            "timestamp": get_iraq_time().isoformat()
+        }), 500
+
+
 def handle_download_backup_archive(decoded_token, data):
     """Generate (or reuse) a zipped backup archive and return base64 content."""
     try:

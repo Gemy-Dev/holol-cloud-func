@@ -12,10 +12,10 @@ from modules.auth import verify_token, reset_password, set_password
 from modules.users import create_user, update_user, delete_user
 from modules.products import get_products, get_plan_products, get_clients, delete_client_and_tasks
 from modules.tasks import (
-    create_plan_tasks, 
-    create_tasks_for_new_client, 
-    create_tasks_from_product, 
-    get_task_stats, 
+    create_plan_tasks,
+    create_tasks_for_new_client,
+    create_tasks_from_product,
+    get_task_stats,
     get_all_tasks_stats,
     get_tasks_by_date_range
 )
@@ -27,6 +27,7 @@ from modules.backups import (
     handle_restore_status,
     handle_download_backup_archive,
     handle_upload_backup_archive,
+    handle_delete_backup,
 )
 from modules.notifications import (
     handle_daily_notifications,
@@ -34,6 +35,12 @@ from modules.notifications import (
     handle_send_notification_to_all,
 )
 from modules.email import send_email
+from modules.apk_manager import (
+    upload_apks,
+    get_apk_download_url,
+    get_all_apk_versions,
+    delete_apk_version,
+)
 
 # Initialize Firebase Admin SDK (once)
 cred = credentials.ApplicationDefault()
@@ -171,7 +178,10 @@ def route_request(action, data, request):
     
     elif action == "uploadBackupArchive":
         return handle_upload_backup_archive(decoded_token, data)
-    
+
+    elif action == "deleteBackup":
+        return handle_delete_backup(decoded_token, data, db)
+
     elif action == "sendNotification":
         return handle_send_notification(decoded_token, data, db)
     
@@ -182,19 +192,33 @@ def route_request(action, data, request):
         return reset_password(data, decoded_token)
     
     elif action == "setPassword":
-        return set_password(data, decoded_token)
+        return set_password(data, decoded_token, db)
     elif action == "sendEmail":
         title = data.get("title")
         body = data.get("body")
-        
+
         if not title:
             return jsonify({"error": "title is required"}), 400
-        
+
         if not body:
             return jsonify({"error": "body is required"}), 400
-        
+
         return send_email(title, body, db)
-    
+
+    # APK Management (no auth required for download)
+    elif action == "getApkDownloadUrl":
+        return get_apk_download_url(data, db)
+
+    # APK Management (admin only)
+    elif action == "uploadApks":
+        return upload_apks(data, decoded_token, db)
+
+    elif action == "getAllApkVersions":
+        return get_all_apk_versions(decoded_token, db)
+
+    elif action == "deleteApkVersion":
+        return delete_apk_version(data, decoded_token, db)
+
     else:
         return jsonify({"error": "Invalid action"}), 400
 
