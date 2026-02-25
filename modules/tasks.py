@@ -8,17 +8,16 @@ from datetime import datetime
 def _fetch_eligible_clients(department_ids, cities, db):
     """Fetch eligible clients based on departments and cities.
     
-    Only returns clients with state "approved" (approved).
     Handles Firebase whereIn limitation (max 10 values) by batching.
     Returns detailed error information if no clients found.
-    
+
     Args:
         department_ids: List of department IDs
         cities: List of city names
         db: Firestore database instance
-        
+
     Returns:
-        List of client dictionaries with id added (only approved clients)
+        List of client dictionaries with id added
         
     Raises:
         Exception: If no clients found or query fails, with detailed error info
@@ -96,14 +95,12 @@ def _fetch_eligible_clients(department_ids, cities, db):
         diagnostic_info["sample_cities"] = list(sample_cities)[:20]
         diagnostic_info["all_db_cities"] = list(all_db_cities)[:50]  # All cities found in DB
         
-        # Test individual queries for diagnostics (with approved state filter)
-        approved_state = "approved"
+        # Test individual queries for diagnostics
         for dept_id in department_ids_list[:5]:
             try:
                 dept_results = list(
                     db.collection("clients")
                     .where("department", "==", dept_id)
-                    .where("state", "==", approved_state)
                     .limit(3)
                     .stream()
                 )
@@ -111,13 +108,12 @@ def _fetch_eligible_clients(department_ids, cities, db):
                     diagnostic_info["department_matches"] += len(dept_results)
             except Exception:
                 pass
-        
+
         for city_name in cities_list[:5]:
             try:
                 city_results = list(
                     db.collection("clients")
                     .where("city", "==", city_name)
-                    .where("state", "==", approved_state)
                     .limit(3)
                     .stream()
                 )
@@ -125,14 +121,13 @@ def _fetch_eligible_clients(department_ids, cities, db):
                     diagnostic_info["city_matches"] += len(city_results)
             except Exception:
                 pass
-        
+
         if department_ids_list and cities_list:
             try:
                 combined_results = list(
                     db.collection("clients")
                     .where("department", "==", department_ids_list[0])
                     .where("city", "==", cities_list[0])
-                    .where("state", "==", approved_state)
                     .limit(3)
                     .stream()
                 )
@@ -155,7 +150,6 @@ def _fetch_eligible_clients(department_ids, cities, db):
         cities_set = {str(city).strip() for city in cities_list}
         
         # Approved state to filter by
-        approved_state = "approved"
         
         # Execute batched queries
         # Strategy: If we have many cities (>10), query by department first, then filter by city in memory
@@ -173,17 +167,13 @@ def _fetch_eligible_clients(department_ids, cities, db):
                     else:
                         base_query = base_query.where("department", "in", batch_departments)
                     
-                    # Add state filter: only approved clients
-                    base_query = base_query.where("state", "==", approved_state)
-                    
-                    # Get all clients matching departments and state, then filter by city
+                    # Get all clients matching departments, then filter by city
                     for doc in base_query.stream():
                         client = doc.to_dict()
                         client_city = str(client.get("city", "")).strip()
-                        client_state = str(client.get("state", "")).strip()
-                        
-                        # Check if client's city matches any requested city and state is approved
-                        if client_city in cities_set and client_state == approved_state:
+
+                        # Check if client's city matches any requested city
+                        if client_city in cities_set:
                             client["id"] = doc.id
                             all_clients.append(client)
                             
@@ -215,9 +205,6 @@ def _fetch_eligible_clients(department_ids, cities, db):
                         else:
                             base_query = base_query.where("city", "in", batch_cities)
                         
-                        # Add state filter: only approved clients
-                        base_query = base_query.where("state", "==", approved_state)
-                        
                         for doc in base_query.stream():
                             client = doc.to_dict()
                             client["id"] = doc.id
@@ -241,8 +228,7 @@ def _fetch_eligible_clients(department_ids, cities, db):
         
         # Throw detailed exception if no clients found
         if len(unique_clients) == 0:
-            # Fallback: Check what cities actually exist for the requested departments (with approved state)
-            approved_state = "approved"
+            # Fallback: Check what cities actually exist for the requested departments
             actual_cities_for_depts = set()
             try:
                 for i in range(0, min(len(department_ids_list), batch_size)):
@@ -250,7 +236,6 @@ def _fetch_eligible_clients(department_ids, cities, db):
                     test_query = (
                         db.collection("clients")
                         .where("department", "==", test_dept)
-                        .where("state", "==", approved_state)
                         .limit(20)
                         .stream()
                     )
@@ -267,7 +252,7 @@ def _fetch_eligible_clients(department_ids, cities, db):
             error_parts = ["No clients found matching the criteria"]
             error_parts.append(f"Requested departments: {department_ids_list}")
             error_parts.append(f"Requested cities: {cities_list}")
-            error_parts.append(f"Required state: approved (approved)")
+            error_parts.append(f"No state filter applied")
             
             if diagnostic_info["dept_mismatches"]:
                 error_parts.append(f"Department IDs not in database: {diagnostic_info['dept_mismatches']}")
@@ -286,7 +271,7 @@ def _fetch_eligible_clients(department_ids, cities, db):
             
             # Additional diagnostic: Check if any clients exist with the requested departments
             if diagnostic_info["department_matches"] == 0:
-                error_parts.append("No approved clients (approved) found with requested departments (even without city filter)")
+                error_parts.append("No clients found with requested departments (even without city filter)")
             
             # Show actual cities that exist for the requested departments
             if "actual_cities_for_departments" in diagnostic_info:
@@ -439,7 +424,7 @@ def _create_doctor_task(plan_id, plan_data, client, product, marketing_task, doc
             "clientId": client["id"],
             "targetDate": None,  # Optional, can be set later
             "productId": product["id"],
-            "status": "قيد الانجاز",  # Default status (TaskStatus enum)
+            "status": "pending",  # Default status (TaskStatus enum)
             "cancelReason": None,  # Optional
             "reviewState": "approved",  # Default review state (ReviewState enum)
             "visitResult": None,  # Optional
@@ -469,7 +454,7 @@ def create_plan_tasks(data, db):
     
     Matches the Dart implementation behavior:
     - Checks for existing tasks to avoid duplicates
-    - Only creates tasks for approved clients (reviewState = "approved")
+    - Creates tasks for all matching clients (no state filter)
     
     Args:
         data: Request data containing plan information
@@ -571,9 +556,17 @@ def create_plan_tasks(data, db):
             
             total_influencer_doctors += len(influencer_doctors)
             
+            # Get client's department for product matching
+            client_department = client.get("department")
+
             # Loop through each influencer doctor
             for doctor in influencer_doctors:
                 for product in products:
+                    # Only create tasks if client's department matches product's departments
+                    product_departments = product.get("departmentsIds", [])
+                    if client_department and product_departments and client_department not in product_departments:
+                        continue
+
                     marketing_tasks = product.get("marketingTasks", [])
                     if not marketing_tasks:
                         continue
@@ -676,7 +669,6 @@ def create_tasks_for_new_client(data, db):
     
     client_city = client_data.get("city")
     client_department = client_data.get("department")
-    client_state = client_data.get("state")
     
     if not client_city:
         return jsonify({
@@ -692,15 +684,7 @@ def create_tasks_for_new_client(data, db):
             "clientId": client_id
         }), 400
     
-    # Only process approved clients
-    if client_state != "approved":
-        return jsonify({
-            "success": True,
-            "message": "Client is not approved yet. No tasks created.",
-            "clientId": client_id,
-            "clientState": client_state,
-            "tasksCreated": 0
-        })
+  
     
     try:
         # Find matching plans where:
@@ -908,7 +892,6 @@ def create_tasks_from_product(data, db):
     5. Gets all clients from clients collection where:
        - Client's department is in product's departmentsIds
        - Client's city is in plan's cities
-       - Client's state is "approved" (approved)
     6. For each matching client:
        - Gets influencer doctors from client
        - Creates tasks for each doctor, product, and marketing task combination
@@ -1007,9 +990,8 @@ def create_tasks_from_product(data, db):
         # Get all clients where:
         # - Client's department is in product's departmentsIds
         # - Client's city is in plan's cities
-        # - Client's state is "approved" (approved)
+        # No state filter applied
         eligible_clients = []
-        approved_state = "approved"
         
         try:
             # Query clients by department (handle Firebase whereIn limitation)
@@ -1023,7 +1005,6 @@ def create_tasks_from_product(data, db):
                 clients_query = (
                     db.collection("clients")
                     .where("department", "in", dept_batch)
-                    .where("state", "==", approved_state)
                     .stream()
                 )
                 
@@ -1367,6 +1348,84 @@ def get_all_tasks_stats(db):
         # print(trace)
         return jsonify({
             "error": f"Failed to get stats: {str(e)}",
+            "success": False
+        }), 500
+
+
+def get_completed_tasks_status(db):
+    """Get completed task counts grouped by user, product, and client.
+
+    Loops through all tasks, filters completed ones (status == "مكتمل"),
+    and returns counts grouped by assignedToId, productId, and clientId.
+
+    Args:
+        db: Firestore database instance
+
+    Returns:
+        JSON response with:
+        {
+            "users": [{"id": "userId", "count": N}, ...],
+            "products": [{"id": "productId", "count": N}, ...],
+            "clients": [{"id": "clientId", "count": N}, ...]
+        }
+    """
+    try:
+        tasks_query = db.collection("tasks").stream()
+
+        users_map = {}
+        products_map = {}
+        clients_map = {}
+        total_completed = 0
+
+        for doc in tasks_query:
+            task = doc.to_dict()
+            status = task.get("status")
+            review_state = task.get("reviewState")
+
+            # Only count completed tasks that are not deleted
+            if status not in ("مكتمل", "completed") or review_state == "deleted":
+                continue
+
+            total_completed += 1
+
+            # Count by user
+            user_id = task.get("assignedToId")
+            if user_id:
+                users_map[user_id] = users_map.get(user_id, 0) + 1
+
+            # Count by product
+            product_id = task.get("productId")
+            if product_id:
+                products_map[product_id] = products_map.get(product_id, 0) + 1
+
+            # Count by client
+            client_id = task.get("clientId")
+            if client_id:
+                clients_map[client_id] = clients_map.get(client_id, 0) + 1
+
+        users_list = [{"id": uid, "count": count} for uid, count in users_map.items()]
+        products_list = [{"id": pid, "count": count} for pid, count in products_map.items()]
+        clients_list = [{"id": cid, "count": count} for cid, count in clients_map.items()]
+
+        # Sort by count descending
+        users_list.sort(key=lambda x: x["count"], reverse=True)
+        products_list.sort(key=lambda x: x["count"], reverse=True)
+        clients_list.sort(key=lambda x: x["count"], reverse=True)
+
+        return jsonify({
+            "success": True,
+            "totalCompleted": total_completed,
+            "data": {
+                "users": users_list,
+                "products": products_list,
+                "clients": clients_list,
+            }
+        })
+
+    except Exception as e:
+        print(f"Error getting completed tasks status: {str(e)}")
+        return jsonify({
+            "error": f"Failed to get completed tasks status: {str(e)}",
             "success": False
         }), 500
 

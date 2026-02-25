@@ -17,6 +17,7 @@ from modules.tasks import (
     create_tasks_from_product,
     get_task_stats,
     get_all_tasks_stats,
+    get_completed_tasks_status,
     get_tasks_by_date_range
 )
 from modules.backups import (
@@ -41,6 +42,7 @@ from modules.apk_manager import (
     get_all_apk_versions,
     delete_apk_version,
 )
+from modules.opportunities import get_opportunity_stats
 
 # Initialize Firebase Admin SDK (once)
 cred = credentials.ApplicationDefault()
@@ -106,7 +108,15 @@ def route_request(action, data, request):
     # Get all tasks stats (no auth required - for admin use)
     elif action == "getAllTasksStats":
         return get_all_tasks_stats(db)
-  
+
+    # Get completed tasks status grouped by user, product, client
+    elif action == "getCompletedTasksStatus":
+        return get_completed_tasks_status(db)
+
+    # Get opportunity stats grouped by mainId
+    elif action == "getOpportunityStats":
+        return get_opportunity_stats(db)
+
     # API actions (auth required)
     decoded_token, error, status = verify_token(request)
     if error:
