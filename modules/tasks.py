@@ -2,7 +2,7 @@
 from flask import jsonify
 from firebase_admin import firestore
 import traceback
-from datetime import datetime
+from datetime import datetime, timezone
 
 
 def _fetch_eligible_clients(department_ids, cities, db):
@@ -343,18 +343,18 @@ def _fetch_target_products_simple(product_ids, db):
         raise Exception("No product IDs provided")
     
     products = []
-    product_ids_set = set(product_ids)
-    
+
     try:
-        for doc in db.collection("products").stream():
-            if doc.id in product_ids_set:
+        for pid in product_ids:
+            doc = db.collection("products").document(pid).get()
+            if doc.exists:
                 product = doc.to_dict()
                 product["id"] = doc.id
                 products.append(product)
-        
+
         if not products:
             raise Exception(f"No products found for IDs: {product_ids}")
-        
+
         return products
     except Exception as e:
         if "No products found" in str(e):
@@ -414,7 +414,7 @@ def _create_doctor_task(plan_id, plan_data, client, product, marketing_task, doc
         elif isinstance(client_priority, str):
             priority_name = client_priority
         else:
-            priority_name = "medium"  # Default priority
+            priority_name = "c"  # Default priority
         
         # Create new task matching Flutter TaskModel structure with doctor info
         task_data = {
@@ -433,7 +433,7 @@ def _create_doctor_task(plan_id, plan_data, client, product, marketing_task, doc
             "doctorName": doctor.get("name", ""),  # Doctor name from influencer doctor
             "createdAt": firestore.SERVER_TIMESTAMP,  # type: ignore[attr-defined]
             "updatedAt": firestore.SERVER_TIMESTAMP,  # type: ignore[attr-defined]
-            "marketingTask": marketing_task_data,  # Keep for backward compatibility
+            "marketingTask": marketing_task_name,  # Store as string to match duplicate check query
         }
         
         task_ref = db.collection("tasks").document()
@@ -548,19 +548,21 @@ def create_plan_tasks(data, db):
         for client in clients:
             # Extract influencer doctors from client's additional info
             influencer_doctors = _extract_influencer_doctors(client)
-            
-            # Track clients without influencer doctors
+
+            # If no influencer doctors, create tasks without doctor info
             if not influencer_doctors:
                 clients_without_doctors += 1
-                continue
-            
+                doctors_to_process = [{"name": "", "phone": "", "email": ""}]
+            else:
+                doctors_to_process = influencer_doctors
+
             total_influencer_doctors += len(influencer_doctors)
-            
+
             # Get client's department for product matching
             client_department = client.get("department")
 
-            # Loop through each influencer doctor
-            for doctor in influencer_doctors:
+            # Loop through each doctor (or empty doctor placeholder)
+            for doctor in doctors_to_process:
                 for product in products:
                     # Only create tasks if client's department matches product's departments
                     product_departments = product.get("departmentsIds", [])
@@ -693,21 +695,38 @@ def create_tasks_for_new_client(data, db):
         matching_plans = []
         
         try:
-            # Get all plans
-            plans_query = db.collection("plans").stream()
-            
+            # Query plans where client's city is in plan.cities (server-side filter)
+            # Firestore only supports one array_contains per query, so filter department in Python
+            plans_query = (
+                db.collection("plans")
+                .where("cities", "array_contains", client_city)
+                .stream()
+            )
+
+            now = datetime.now(timezone.utc)
+
             for plan_doc in plans_query:
                 plan = plan_doc.to_dict()
                 plan["id"] = plan_doc.id
-                
-                plan_cities = plan.get("cities", [])
+
+                # Skip expired plans (endDate in the past)
+                plan_end_date = plan.get("endDate")
+                if plan_end_date:
+                    if hasattr(plan_end_date, 'timestamp'):
+                        end_dt = datetime.fromtimestamp(plan_end_date.timestamp(), tz=timezone.utc)
+                    elif isinstance(plan_end_date, datetime):
+                        end_dt = plan_end_date if plan_end_date.tzinfo else plan_end_date.replace(tzinfo=timezone.utc)
+                    else:
+                        end_dt = None
+                    if end_dt and end_dt < now:
+                        continue
+
                 plan_departments = plan.get("departmentsIds", [])
                 plan_clients_ids = plan.get("clientsIds", [])
-                
-                # Check if client's city and department match the plan
+
+                # Check if client's department matches the plan
                 # AND client is not already in the plan's clientsIds
-                if (client_city in plan_cities and 
-                    client_department in plan_departments and 
+                if (client_department in plan_departments and
                     client_id not in plan_clients_ids):
                     matching_plans.append(plan)
         
@@ -730,127 +749,115 @@ def create_tasks_for_new_client(data, db):
         
         # Extract influencer doctors from client
         influencer_doctors = _extract_influencer_doctors(client_data)
-        
+
+        # If no influencer doctors, create tasks without doctor info
         if not influencer_doctors:
-            return jsonify({
-                "success": True,
-                "message": "Client has no influencer doctors. No tasks created.",
-                "clientId": client_id,
-                "matchingPlans": len(matching_plans),
-                "tasksCreated": 0
-            })
-        
+            doctors_to_process = [{"name": "", "phone": "", "email": ""}]
+        else:
+            doctors_to_process = influencer_doctors
+
         # Create tasks for each matching plan
         total_created = 0
         total_skipped = 0
         task_errors = []
         plans_processed = []
-        
+
         for plan in matching_plans:
             plan_id = plan.get("id")
             if not plan_id:
                 continue
-            
+
+            plan_created = 0
+            plan_skipped = 0
+            eligible_products = []
+
             # Get product IDs from plan.targetProductSales
             target_product_sales = plan.get("targetProductSales", [])
-            if not target_product_sales:
-                continue
-            
+
             product_ids = []
             for item in target_product_sales:
                 if isinstance(item, dict):
                     product_id = item.get("productId")
                     if product_id:
                         product_ids.append(product_id)
-            
-            if not product_ids:
-                continue
-            
+
             # Fetch products and filter by client department
-            try:
-                eligible_products = []
-                
-                for product_id in product_ids:
-                    product_doc = db.collection("products").document(product_id).get()
-                    if not product_doc.exists:
-                        continue
-                    
-                    product = product_doc.to_dict()
-                    product["id"] = product_doc.id
-                    
-                    # Check if client's department is in product's departmentsIds
-                    product_departments = product.get("departmentsIds", [])
-                    if client_department in product_departments:
-                        eligible_products.append(product)
-                
-                if not eligible_products:
-                    continue
-                
-                # Create tasks for each influencer doctor, product, and marketing task
-                plan_created = 0
-                plan_skipped = 0
-                
-                for doctor in influencer_doctors:
-                    for product in eligible_products:
-                        marketing_tasks = product.get("marketingTasks", [])
-                        if not marketing_tasks:
-                            continue
-                        
-                        for marketing_task in marketing_tasks:
-                            try:
-                                created = _create_doctor_task(
-                                    plan_id,
-                                    plan,
-                                    client_data,
-                                    product,
-                                    marketing_task,
-                                    doctor,
-                                    db
-                                )
-                                if created:
-                                    plan_created += 1
-                                else:
-                                    plan_skipped += 1
-                            except Exception as task_error:
-                                task_errors.append({
-                                    "planId": plan_id,
-                                    "clientId": client_id,
-                                    "doctorName": doctor.get("name"),
-                                    "productId": product.get("id"),
-                                    "error": str(task_error)
-                                })
-                                continue
-                
-                total_created += plan_created
-                total_skipped += plan_skipped
-                
-                # Update plan to add client ID to clientsIds array
+            if product_ids:
                 try:
-                    plan_ref = db.collection("plans").document(plan_id)
-                    plan_ref.update({
-                        "clientsIds": firestore.ArrayUnion([client_id])  # type: ignore[attr-defined]
-                    })
-                except Exception as update_error:
-                    # Log error but don't fail the entire operation
+                    for product_id in product_ids:
+                        product_doc = db.collection("products").document(product_id).get()
+                        if not product_doc.exists:
+                            continue
+
+                        product = product_doc.to_dict()
+                        product["id"] = product_doc.id
+
+                        # Check if client's department is in product's departmentsIds
+                        product_departments = product.get("departmentsIds", [])
+                        if client_department in product_departments:
+                            eligible_products.append(product)
+
+                    # Create tasks for each doctor (or placeholder), product, and marketing task
+                    for doctor in doctors_to_process:
+                        for product in eligible_products:
+                            marketing_tasks = product.get("marketingTasks", [])
+                            if not marketing_tasks:
+                                continue
+
+                            for marketing_task in marketing_tasks:
+                                try:
+                                    created = _create_doctor_task(
+                                        plan_id,
+                                        plan,
+                                        client_data,
+                                        product,
+                                        marketing_task,
+                                        doctor,
+                                        db
+                                    )
+                                    if created:
+                                        plan_created += 1
+                                    else:
+                                        plan_skipped += 1
+                                except Exception as task_error:
+                                    task_errors.append({
+                                        "planId": plan_id,
+                                        "clientId": client_id,
+                                        "doctorName": doctor.get("name"),
+                                        "productId": product.get("id"),
+                                        "error": str(task_error)
+                                    })
+                                    continue
+
+                    total_created += plan_created
+                    total_skipped += plan_skipped
+
+                except Exception as plan_error:
                     task_errors.append({
                         "planId": plan_id,
-                        "error": f"Failed to update plan clientsIds: {str(update_error)}"
+                        "error": f"Failed to process plan: {str(plan_error)}"
                     })
-                
-                plans_processed.append({
-                    "planId": plan_id,
-                    "planTitle": plan.get("title", ""),
-                    "tasksCreated": plan_created,
-                    "tasksSkipped": plan_skipped,
-                    "productsProcessed": len(eligible_products)
+
+            # Always update plan to add client ID to clientsIds array
+            # even if no eligible products matched, to prevent re-processing
+            try:
+                plan_ref = db.collection("plans").document(plan_id)
+                plan_ref.update({
+                    "clientsIds": firestore.ArrayUnion([client_id])  # type: ignore[attr-defined]
                 })
-            
-            except Exception as plan_error:
+            except Exception as update_error:
                 task_errors.append({
                     "planId": plan_id,
-                    "error": f"Failed to process plan: {str(plan_error)}"
+                    "error": f"Failed to update plan clientsIds: {str(update_error)}"
                 })
-                continue
+
+            plans_processed.append({
+                "planId": plan_id,
+                "planTitle": plan.get("title", ""),
+                "tasksCreated": plan_created,
+                "tasksSkipped": plan_skipped,
+                "productsProcessed": len(eligible_products)
+            })
         
         response = {
             "success": True,
@@ -988,17 +995,29 @@ def create_tasks_from_product(data, db):
             })
         
         # Get all clients where:
-        # - Client's department is in product's departmentsIds
+        # - Client's department is in BOTH product's departmentsIds AND plan's departmentsIds
         # - Client's city is in plan's cities
-        # No state filter applied
+        plan_departments = plan.get("departmentsIds", [])
+        # Only target departments that exist in both the product and the plan
+        target_departments = [d for d in product_departments if d in plan_departments]
+
+        if not target_departments:
+            return jsonify({
+                "success": True,
+                "message": "No overlapping departments between product and plan. No tasks created.",
+                "planId": plan_id,
+                "productId": product_id,
+                "tasksCreated": 0
+            })
+
         eligible_clients = []
-        
+
         try:
             # Query clients by department (handle Firebase whereIn limitation)
             department_batches = []
             batch_size = 10
-            for i in range(0, len(product_departments), batch_size):
-                batch = product_departments[i:i + batch_size]
+            for i in range(0, len(target_departments), batch_size):
+                batch = target_departments[i:i + batch_size]
                 department_batches.append(batch)
             
             for dept_batch in department_batches:
@@ -1059,14 +1078,18 @@ def create_tasks_from_product(data, db):
             
             # Extract influencer doctors from client
             influencer_doctors = _extract_influencer_doctors(client)
+
+            # If no influencer doctors, create tasks without doctor info
             if not influencer_doctors:
-                continue
-            
+                doctors_to_process = [{"name": "", "phone": "", "email": ""}]
+            else:
+                doctors_to_process = influencer_doctors
+
             client_created = 0
             client_skipped = 0
-            
-            # Create tasks for each doctor, product, and marketing task combination
-            for doctor in influencer_doctors:
+
+            # Create tasks for each doctor (or placeholder), product, and marketing task combination
+            for doctor in doctors_to_process:
                 for marketing_task in marketing_tasks:
                     try:
                         created = _create_doctor_task(
