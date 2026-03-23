@@ -1,9 +1,11 @@
 """Email module for sending emails."""
 import smtplib
 import re
+import base64
 import traceback
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
+from email.mime.application import MIMEApplication
 from flask import jsonify
 from modules.config import (
     EMAIL_SMTP_HOST,
@@ -288,4 +290,152 @@ def send_email(title, body, db):
             "success": False,
             "error": error_msg
         }), 500
+
+
+def send_daily_report(data, db):
+    """Send daily report PDF via email to users with receiveEmailNotifications enabled.
+
+    Args:
+        data: Dictionary containing reportId, userId, userName, date, pdfBase64, tasksCount
+        db: Firestore database instance
+
+    Returns:
+        JSON response with success status and details
+    """
+    try:
+        # Validate required fields
+        report_id = data.get("reportId")
+        user_id = data.get("userId")
+        user_name = data.get("userName", "")
+        date = data.get("date", "")
+        pdf_base64 = data.get("pdfBase64")
+        tasks_count = data.get("tasksCount", 0)
+
+        if not report_id:
+            return jsonify({"success": False, "error": "reportId is required"}), 400
+
+        if not user_id:
+            return jsonify({"success": False, "error": "userId is required"}), 400
+
+        if not pdf_base64:
+            return jsonify({"success": False, "error": "pdfBase64 is required"}), 400
+
+        # Validate email configuration
+        config_valid, config_error = _check_email_config()
+        if not config_valid:
+            return jsonify({
+                "success": False,
+                "error": f"Email configuration error: {config_error}"
+            }), 500
+
+        # Decode the base64 PDF
+        try:
+            pdf_bytes = base64.b64decode(pdf_base64)
+        except Exception:
+            return jsonify({"success": False, "error": "Invalid pdfBase64 data"}), 400
+
+        # Fetch email recipients from Firestore
+        try:
+            recipient_emails = _fetch_email_recipients(db)
+        except Exception as e:
+            return jsonify({"success": False, "error": str(e)}), 500
+
+        if not recipient_emails:
+            return jsonify({
+                "success": False,
+                "error": "No users found with receiveEmailNotifications enabled",
+                "totalRecipients": 0
+            }), 404
+
+        # Build email subject and body
+        subject = f"التقرير اليومي - {user_name} - {date}"
+        body_text = (
+            f"التقرير اليومي\n\n"
+            f"الاسم: {user_name}\n"
+            f"التاريخ: {date}\n"
+            f"عدد المهام: {tasks_count}\n\n"
+            f"يرجى الاطلاع على التقرير المرفق."
+        )
+
+        # Send email via SMTP
+        try:
+            if EMAIL_SMTP_PORT == 465:
+                server = smtplib.SMTP_SSL(EMAIL_SMTP_HOST, EMAIL_SMTP_PORT)
+            else:
+                server = smtplib.SMTP(EMAIL_SMTP_HOST, EMAIL_SMTP_PORT)
+                server.starttls()
+
+            server.login(EMAIL_SMTP_USER, EMAIL_SMTP_PASSWORD)
+
+            failed_recipients = []
+            successful_recipients = []
+
+            for recipient in recipient_emails:
+                try:
+                    msg = MIMEMultipart()
+                    msg['From'] = f"{EMAIL_FROM_NAME} <{EMAIL_FROM_ADDRESS}>"
+                    msg['To'] = recipient
+                    msg['Subject'] = subject
+
+                    msg.attach(MIMEText(body_text, 'plain', 'utf-8'))
+
+                    # Attach PDF
+                    pdf_attachment = MIMEApplication(pdf_bytes, _subtype='pdf')
+                    pdf_filename = f"report_{user_name}_{date}.pdf"
+                    pdf_attachment.add_header(
+                        'Content-Disposition', 'attachment', filename=pdf_filename
+                    )
+                    msg.attach(pdf_attachment)
+
+                    server.sendmail(EMAIL_FROM_ADDRESS, recipient, msg.as_string())
+                    successful_recipients.append(recipient)
+                    print(f"Daily report email sent to: {recipient}")
+                except Exception as recipient_error:
+                    failed_recipients.append({
+                        "email": recipient,
+                        "error": str(recipient_error)
+                    })
+                    print(f"Failed to send daily report to {recipient}: {str(recipient_error)}")
+
+            server.quit()
+
+            if len(successful_recipients) == 0:
+                return jsonify({
+                    "success": False,
+                    "error": "Failed to send daily report to all recipients",
+                    "failedTo": failed_recipients,
+                    "totalRecipients": len(recipient_emails)
+                }), 500
+
+            response = {
+                "success": True,
+                "message": f"Daily report sent to {len(successful_recipients)} recipient(s)",
+                "totalRecipients": len(recipient_emails),
+                "successfulRecipients": len(successful_recipients),
+                "failedRecipients": len(failed_recipients),
+            }
+
+            if failed_recipients:
+                response["failedTo"] = failed_recipients
+                return jsonify(response), 207
+
+            return jsonify(response), 200
+
+        except smtplib.SMTPAuthenticationError:
+            return jsonify({
+                "success": False,
+                "error": "SMTP authentication failed. Please check your email credentials."
+            }), 500
+
+        except smtplib.SMTPException as smtp_error:
+            return jsonify({
+                "success": False,
+                "error": f"SMTP error: {str(smtp_error)}"
+            }), 500
+
+    except Exception as e:
+        error_msg = f"Error sending daily report: {str(e)}"
+        print(f"{error_msg}")
+        print(traceback.format_exc())
+        return jsonify({"success": False, "error": error_msg}), 500
 

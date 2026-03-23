@@ -35,7 +35,7 @@ from modules.notifications import (
     handle_send_notification,
     handle_send_notification_to_all,
 )
-from modules.email import send_email
+from modules.email import send_email, send_daily_report
 from modules.apk_manager import (
     upload_apks,
     get_apk_download_url,
@@ -214,6 +214,9 @@ def route_request(action, data, request):
             return jsonify({"error": "body is required"}), 400
 
         return send_email(title, body, db)
+
+    elif action == "sendDailyReport":
+        return send_daily_report(data, db)
 
     # APK Management (no auth required for download)
     elif action == "getApkDownloadUrl":
