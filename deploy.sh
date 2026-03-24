@@ -114,7 +114,8 @@ deploy_main_function() {
         --timeout=540s \
         --set-env-vars="GOOGLE_CLOUD_PROJECT=$PROJECT_ID,ALLOWED_ORIGINS=*" \
         --max-instances=10 \
-        --min-instances=0
+        --min-instances=0  \
+  --set-env-vars EMAIL_SMTP_PASSWORD="dvgtizshxpxxefxn"
     
     DEPLOY_RESULT=$?
     

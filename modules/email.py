@@ -95,40 +95,80 @@ def _check_email_config():
 
 def _fetch_email_recipients(db):
     """Fetch email addresses from users collection where receiveEmailNotifications is true.
-    
+
     Args:
         db: Firestore database instance
-        
+
     Returns:
         List of email addresses (strings)
-        
+
     Raises:
         Exception: If query fails
     """
     try:
         recipient_emails = []
-        
+
         # Query users where receiveEmailNotifications is true
         users_query = (
             db.collection("users")
             .where("receiveEmailNotifications", "==", True)
             .stream()
         )
-        
+
         for user_doc in users_query:
             user_data = user_doc.to_dict()
             email = user_data.get("email")
-            
+
             # Validate and add email
             if email and isinstance(email, str):
                 email = email.strip()
                 if email and _validate_email(email):
                     recipient_emails.append(email)
-        
+
         return recipient_emails
-        
+
     except Exception as e:
         raise Exception(f"Failed to fetch email recipients from users collection: {str(e)}")
+
+
+def _fetch_recipients_by_permission(db, permission):
+    """Fetch recipients from email_recipients collection filtered by permission.
+
+    Args:
+        db: Firestore database instance
+        permission: Permission string to filter by (e.g. 'receiveDailyReport', 'receiveOrders')
+
+    Returns:
+        List of dicts with 'email' and 'name' keys
+
+    Raises:
+        Exception: If query fails
+    """
+    try:
+        recipients = []
+
+        # Query email_recipients where isActive is true and permissions contains the permission
+        query = (
+            db.collection("email_recipients")
+            .where("isActive", "==", True)
+            .where("permissions", "array_contains", permission)
+            .stream()
+        )
+
+        for doc in query:
+            data = doc.to_dict()
+            email = data.get("email", "")
+            name = data.get("name", "")
+
+            if email and isinstance(email, str):
+                email = email.strip()
+                if email and _validate_email(email):
+                    recipients.append({"email": email, "name": name})
+
+        return recipients
+
+    except Exception as e:
+        raise Exception(f"Failed to fetch email recipients: {str(e)}")
 
 
 def send_email(title, body, db):
@@ -334,16 +374,16 @@ def send_daily_report(data, db):
         except Exception:
             return jsonify({"success": False, "error": "Invalid pdfBase64 data"}), 400
 
-        # Fetch email recipients from Firestore
+        # Fetch recipients with receiveDailyReport permission from email_recipients collection
         try:
-            recipient_emails = _fetch_email_recipients(db)
+            recipients = _fetch_recipients_by_permission(db, "receiveDailyReport")
         except Exception as e:
             return jsonify({"success": False, "error": str(e)}), 500
 
-        if not recipient_emails:
+        if not recipients:
             return jsonify({
                 "success": False,
-                "error": "No users found with receiveEmailNotifications enabled",
+                "error": "No active recipients found with receiveDailyReport permission",
                 "totalRecipients": 0
             }), 404
 
@@ -370,14 +410,19 @@ def send_daily_report(data, db):
             failed_recipients = []
             successful_recipients = []
 
-            for recipient in recipient_emails:
+            for recipient in recipients:
                 try:
+                    recipient_email = recipient["email"]
+                    recipient_name = recipient["name"]
+
                     msg = MIMEMultipart()
                     msg['From'] = f"{EMAIL_FROM_NAME} <{EMAIL_FROM_ADDRESS}>"
-                    msg['To'] = recipient
+                    msg['To'] = recipient_email
                     msg['Subject'] = subject
 
-                    msg.attach(MIMEText(body_text, 'plain', 'utf-8'))
+                    # Personalized body with recipient name
+                    personalized_body = f"مرحباً {recipient_name},\n\n{body_text}"
+                    msg.attach(MIMEText(personalized_body, 'plain', 'utf-8'))
 
                     # Attach PDF
                     pdf_attachment = MIMEApplication(pdf_bytes, _subtype='pdf')
@@ -387,15 +432,15 @@ def send_daily_report(data, db):
                     )
                     msg.attach(pdf_attachment)
 
-                    server.sendmail(EMAIL_FROM_ADDRESS, recipient, msg.as_string())
-                    successful_recipients.append(recipient)
-                    print(f"Daily report email sent to: {recipient}")
+                    server.sendmail(EMAIL_FROM_ADDRESS, recipient_email, msg.as_string())
+                    successful_recipients.append(recipient_email)
+                    print(f"Daily report email sent to: {recipient_name} <{recipient_email}>")
                 except Exception as recipient_error:
                     failed_recipients.append({
-                        "email": recipient,
+                        "email": recipient.get("email", ""),
                         "error": str(recipient_error)
                     })
-                    print(f"Failed to send daily report to {recipient}: {str(recipient_error)}")
+                    print(f"Failed to send daily report to {recipient.get('email', '')}: {str(recipient_error)}")
 
             server.quit()
 
@@ -404,13 +449,13 @@ def send_daily_report(data, db):
                     "success": False,
                     "error": "Failed to send daily report to all recipients",
                     "failedTo": failed_recipients,
-                    "totalRecipients": len(recipient_emails)
+                    "totalRecipients": len(recipients)
                 }), 500
 
             response = {
                 "success": True,
                 "message": f"Daily report sent to {len(successful_recipients)} recipient(s)",
-                "totalRecipients": len(recipient_emails),
+                "totalRecipients": len(recipients),
                 "successfulRecipients": len(successful_recipients),
                 "failedRecipients": len(failed_recipients),
             }
@@ -435,6 +480,172 @@ def send_daily_report(data, db):
 
     except Exception as e:
         error_msg = f"Error sending daily report: {str(e)}"
+        print(f"{error_msg}")
+        print(traceback.format_exc())
+        return jsonify({"success": False, "error": error_msg}), 500
+
+
+def notify_new_deal(data, db):
+    """Send email notification for a new deal/order to recipients with receiveOrders permission.
+
+    Args:
+        data: Dictionary containing deal details (clientId, productId, amount, price, preparationDate, remarks, status)
+        db: Firestore database instance
+
+    Returns:
+        JSON response with success status and details
+    """
+    try:
+        # Extract deal data
+        deal_id = data.get("dealId", "")
+        client_id = data.get("clientId", "")
+        products_ids = data.get("productId", [])
+        amount = data.get("amount", 0)
+        price = data.get("price", 0)
+        preparation_date = data.get("preparationDate", "")
+        remarks = data.get("remarks", "")
+        status = data.get("status", "")
+
+        if not client_id:
+            return jsonify({"success": False, "error": "clientId is required"}), 400
+
+        # Validate email configuration
+        config_valid, config_error = _check_email_config()
+        if not config_valid:
+            return jsonify({
+                "success": False,
+                "error": f"Email configuration error: {config_error}"
+            }), 500
+
+        # Fetch client name
+        client_name = client_id
+        try:
+            client_doc = db.collection("clients").document(client_id).get()
+            if client_doc.exists:
+                client_data = client_doc.to_dict()
+                client_name = client_data.get("name", client_id)
+        except Exception:
+            pass
+
+        # Fetch product names
+        product_names = []
+        for pid in (products_ids if isinstance(products_ids, list) else [products_ids]):
+            try:
+                prod_doc = db.collection("products").document(pid).get()
+                if prod_doc.exists:
+                    prod_data = prod_doc.to_dict()
+                    product_names.append(prod_data.get("name", pid))
+                else:
+                    product_names.append(pid)
+            except Exception:
+                product_names.append(pid)
+
+        # Fetch recipients with receiveOrders permission
+        try:
+            recipients = _fetch_recipients_by_permission(db, "receiveOrders")
+        except Exception as e:
+            return jsonify({"success": False, "error": str(e)}), 500
+
+        if not recipients:
+            return jsonify({
+                "success": False,
+                "error": "No active recipients found with receiveOrders permission",
+                "totalRecipients": 0
+            }), 404
+
+        # Calculate total price
+        total_price = amount * price
+
+        # Build email subject and body
+        subject = f"طلب جديد - {client_name}"
+        body_text = (
+            f"تم إضافة طلب جديد\n\n"
+            f"العميل: {client_name}\n"
+            f"المنتجات: {', '.join(product_names)}\n"
+            f"الكمية: {amount}\n"
+            f"السعر: {price}\n"
+            f"الإجمالي: {total_price}\n"
+            f"تاريخ التحضير: {preparation_date}\n"
+            f"الحالة: {status}\n"
+        )
+        if remarks:
+            body_text += f"ملاحظات: {remarks}\n"
+
+        # Send email via SMTP
+        try:
+            if EMAIL_SMTP_PORT == 465:
+                server = smtplib.SMTP_SSL(EMAIL_SMTP_HOST, EMAIL_SMTP_PORT)
+            else:
+                server = smtplib.SMTP(EMAIL_SMTP_HOST, EMAIL_SMTP_PORT)
+                server.starttls()
+
+            server.login(EMAIL_SMTP_USER, EMAIL_SMTP_PASSWORD)
+
+            failed_recipients = []
+            successful_recipients = []
+
+            for recipient in recipients:
+                try:
+                    recipient_email = recipient["email"]
+                    recipient_name = recipient["name"]
+
+                    msg = MIMEMultipart()
+                    msg['From'] = f"{EMAIL_FROM_NAME} <{EMAIL_FROM_ADDRESS}>"
+                    msg['To'] = recipient_email
+                    msg['Subject'] = subject
+
+                    personalized_body = f"مرحباً {recipient_name},\n\n{body_text}"
+                    msg.attach(MIMEText(personalized_body, 'plain', 'utf-8'))
+
+                    server.sendmail(EMAIL_FROM_ADDRESS, recipient_email, msg.as_string())
+                    successful_recipients.append(recipient_email)
+                    print(f"New deal notification sent to: {recipient_name} <{recipient_email}>")
+                except Exception as recipient_error:
+                    failed_recipients.append({
+                        "email": recipient.get("email", ""),
+                        "error": str(recipient_error)
+                    })
+                    print(f"Failed to send deal notification to {recipient.get('email', '')}: {str(recipient_error)}")
+
+            server.quit()
+
+            if len(successful_recipients) == 0:
+                return jsonify({
+                    "success": False,
+                    "error": "Failed to send deal notification to all recipients",
+                    "failedTo": failed_recipients,
+                    "totalRecipients": len(recipients)
+                }), 500
+
+            response = {
+                "success": True,
+                "message": f"Deal notification sent to {len(successful_recipients)} recipient(s)",
+                "totalRecipients": len(recipients),
+                "successfulRecipients": len(successful_recipients),
+                "failedRecipients": len(failed_recipients),
+                "dealId": deal_id,
+            }
+
+            if failed_recipients:
+                response["failedTo"] = failed_recipients
+                return jsonify(response), 207
+
+            return jsonify(response), 200
+
+        except smtplib.SMTPAuthenticationError:
+            return jsonify({
+                "success": False,
+                "error": "SMTP authentication failed. Please check your email credentials."
+            }), 500
+
+        except smtplib.SMTPException as smtp_error:
+            return jsonify({
+                "success": False,
+                "error": f"SMTP error: {str(smtp_error)}"
+            }), 500
+
+    except Exception as e:
+        error_msg = f"Error sending deal notification: {str(e)}"
         print(f"{error_msg}")
         print(traceback.format_exc())
         return jsonify({"success": False, "error": error_msg}), 500

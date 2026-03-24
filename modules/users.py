@@ -74,8 +74,6 @@ def update_user(data, decoded_token, db):
         user_doc = db.collection("users").document(decoded_token["uid"]).get()
         if not user_doc.exists:
             return jsonify({"error": "Unauthorized"}), 403
-        user_data_check = user_doc.to_dict()
-        
 
     user_data = {
         "name": data.get("name"),
@@ -101,7 +99,7 @@ def update_user(data, decoded_token, db):
 
 def delete_user(data, decoded_token, db):
     """Delete a user from both Firebase Auth and Firestore"""
-    uid = data.get("uid")
+    uid = data.get("uid") or data.get("id")
     if not uid:
         return jsonify({"error": "uid is required"}), 400
 
@@ -110,20 +108,27 @@ def delete_user(data, decoded_token, db):
     if not user_doc.exists:
         return jsonify({"error": "Unauthorized - requesting user not found"}), 403
 
+    errors = []
+
+    # Delete from Firebase Authentication
     try:
-        # Delete from Firebase Authentication
         auth.delete_user(uid)
     except auth.UserNotFoundError:
-        # User doesn't exist in Auth, but we'll still try to delete from Firestore
         pass
     except Exception as auth_error:
-        return jsonify({"error": f"Failed to delete user from Auth: {str(auth_error)}"}), 500
+        errors.append(f"Auth: {str(auth_error)}")
 
+    # Always delete from Firestore, even if Auth deletion failed
     try:
-        # Delete from Firestore
         db.collection("users").document(uid).delete()
     except Exception as db_error:
-        return jsonify({"error": f"Failed to delete user from Firestore: {str(db_error)}"}), 500
+        errors.append(f"Firestore: {str(db_error)}")
+
+    if errors:
+        return jsonify({
+            "error": f"Partial delete failure: {'; '.join(errors)}",
+            "uid": uid
+        }), 500
 
     return jsonify({
         "success": True,

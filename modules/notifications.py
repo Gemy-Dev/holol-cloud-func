@@ -149,7 +149,7 @@ def handle_daily_notifications(db, days_offset=0):
     try:
         # Calculate target date in Iraq time (UTC+3)
         iraq_tz_offset = timedelta(hours=3)
-        iraq_now = datetime.utcnow() + iraq_tz_offset
+        iraq_now = datetime.now(timezone.utc) + iraq_tz_offset
         target_date = (iraq_now.date() + timedelta(days=days_offset)).isoformat()
         
         print(f"🔔 Running task notifications for date: {target_date} (offset: {days_offset})")

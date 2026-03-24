@@ -3,9 +3,9 @@ import os
 
 BACKUP_BUCKET = "medical-advisor-bd734-backups"
 COLLECTIONS_TO_BACKUP = [
-    "users", "products","deals", "clients", "tasks","daily_reports", "plans", "technical_support","main_opportunities", 
+    "users", "products","deals", "clients", "tasks","daily_reports", "plans", "technical_support","main_opportunities",
     "departments", "specialties", "procedures", "companies",
-    "notifications", "reports", "analytics","manufacturers","opportunities"
+    "notifications", "reports", "analytics","manufacturers","opportunities","email_recipients"
 ]
 
 # Email configuration (Gmail)
@@ -23,7 +23,7 @@ COLLECTIONS_TO_BACKUP = [
 EMAIL_SMTP_HOST = os.getenv("EMAIL_SMTP_HOST", "smtp.gmail.com")
 EMAIL_SMTP_PORT = int(os.getenv("EMAIL_SMTP_PORT", "587"))  # 587 for TLS, 465 for SSL
 EMAIL_SMTP_USER = os.getenv("EMAIL_SMTP_USER", "zaid.h.dev@gmail.com")  # Your Gmail address
-EMAIL_SMTP_PASSWORD = os.getenv("EMAIL_SMTP_PASSWORD", "gsctobmblpohtrtn")  # Gmail App Password (not regular password)
+EMAIL_SMTP_PASSWORD = os.getenv("EMAIL_SMTP_PASSWORD")  # Gmail App Password - must be set via environment variable
 EMAIL_FROM_ADDRESS = os.getenv("EMAIL_FROM_ADDRESS", "zaid.h.dev@gmail.com")  # Usually same as EMAIL_SMTP_USER
 EMAIL_FROM_NAME = os.getenv("EMAIL_FROM_NAME", "holol-tibbiya")
 

@@ -149,7 +149,7 @@ def upload_apks(data, decoded_token, db):
             blob = bucket.blob(storage_path)
             try:
                 blob.delete()
-            except:
+            except Exception:
                 pass  # File might not exist
 
             # Upload new file

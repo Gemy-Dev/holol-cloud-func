@@ -1251,7 +1251,7 @@ def get_task_stats(decoded_token, db):
                     else:
                         # Assume simple date string, maybe take first 10 chars
                         date_key = target_date[:10]
-                except:
+                except Exception:
                     # Fallback or ignore invalid formats
                     continue
             elif isinstance(target_date, int):
@@ -1259,7 +1259,7 @@ def get_task_stats(decoded_token, db):
                 try:
                     date_obj = datetime.fromtimestamp(target_date / 1000.0)
                     date_key = date_obj.strftime("%Y-%m-%d")
-                except:
+                except Exception:
                     continue
             
             if date_key:
@@ -1335,7 +1335,7 @@ def get_all_tasks_stats(db):
                     else:
                         # Assume simple date string, maybe take first 10 chars
                         date_key = target_date[:10]
-                except:
+                except Exception:
                     # Fallback or ignore invalid formats
                     continue
             elif isinstance(target_date, int):
@@ -1343,7 +1343,7 @@ def get_all_tasks_stats(db):
                 try:
                     date_obj = datetime.fromtimestamp(target_date / 1000.0)
                     date_key = date_obj.strftime("%Y-%m-%d")
-                except:
+                except Exception:
                     continue
             
             if date_key:
@@ -1555,9 +1555,9 @@ def get_tasks_by_date_range(data, decoded_token, db):
                         task_date = datetime.strptime(target_date_raw[:10], "%Y-%m-%d")
                 elif isinstance(target_date_raw, int):
                     task_date = datetime.fromtimestamp(target_date_raw / 1000.0)
-            except:
+            except Exception:
                 continue
-                
+
             if not task_date:
                 continue
                 
