@@ -650,3 +650,147 @@ def notify_new_deal(data, db):
         print(traceback.format_exc())
         return jsonify({"success": False, "error": error_msg}), 500
 
+
+def send_support_visit_report(data, db):
+    """Send support visit report PDF via email to a provided list of emails.
+
+    Args:
+        data: Dictionary containing visitId, supportRecordId, userName, date, visitType, pdfBase64, emails
+        db: Firestore database instance
+
+    Returns:
+        JSON response with success status and details
+    """
+    try:
+        visit_id = data.get("visitId")
+        support_record_id = data.get("supportRecordId", "")
+        user_name = data.get("userName", "")
+        date = data.get("date", "")
+        visit_type = data.get("visitType", "")
+        pdf_base64 = data.get("pdfBase64")
+        emails = data.get("emails")
+
+        if not visit_id:
+            return jsonify({"success": False, "error": "visitId is required"}), 400
+
+        if not pdf_base64:
+            return jsonify({"success": False, "error": "pdfBase64 is required"}), 400
+
+        if not emails or not isinstance(emails, list) or len(emails) == 0:
+            return jsonify({"success": False, "error": "emails list is required"}), 400
+
+        # Validate all emails
+        invalid_emails = [e for e in emails if not _validate_email(e)]
+        if invalid_emails:
+            return jsonify({
+                "success": False,
+                "error": f"Invalid email addresses: {', '.join(invalid_emails)}"
+            }), 400
+
+        # Validate email configuration
+        config_valid, config_error = _check_email_config()
+        if not config_valid:
+            return jsonify({
+                "success": False,
+                "error": f"Email configuration error: {config_error}"
+            }), 500
+
+        # Decode the base64 PDF
+        try:
+            pdf_bytes = base64.b64decode(pdf_base64)
+        except Exception:
+            return jsonify({"success": False, "error": "Invalid pdfBase64 data"}), 400
+
+        # Build email subject and body
+        subject = f"تقرير زيارة دعم - {user_name} - {date}"
+        body_text = (
+            f"تقرير زيارة دعم\n\n"
+            f"الاسم: {user_name}\n"
+            f"التاريخ: {date}\n"
+            f"نوع الزيارة: {visit_type}\n\n"
+            f"يرجى الاطلاع على التقرير المرفق."
+        )
+
+        # Send email via SMTP
+        try:
+            if EMAIL_SMTP_PORT == 465:
+                server = smtplib.SMTP_SSL(EMAIL_SMTP_HOST, EMAIL_SMTP_PORT)
+            else:
+                server = smtplib.SMTP(EMAIL_SMTP_HOST, EMAIL_SMTP_PORT)
+                server.starttls()
+
+            server.login(EMAIL_SMTP_USER, EMAIL_SMTP_PASSWORD)
+
+            failed_recipients = []
+            successful_recipients = []
+
+            for recipient_email in emails:
+                try:
+                    msg = MIMEMultipart()
+                    msg['From'] = f"{EMAIL_FROM_NAME} <{EMAIL_FROM_ADDRESS}>"
+                    msg['To'] = recipient_email
+                    msg['Subject'] = subject
+
+                    msg.attach(MIMEText(body_text, 'plain', 'utf-8'))
+
+                    # Attach PDF
+                    pdf_attachment = MIMEApplication(pdf_bytes, _subtype='pdf')
+                    pdf_filename = f"support_visit_{user_name}_{date}.pdf"
+                    pdf_attachment.add_header(
+                        'Content-Disposition', 'attachment', filename=pdf_filename
+                    )
+                    msg.attach(pdf_attachment)
+
+                    server.sendmail(EMAIL_FROM_ADDRESS, recipient_email, msg.as_string())
+                    successful_recipients.append(recipient_email)
+                    print(f"Support visit report sent to: {recipient_email}")
+                except Exception as recipient_error:
+                    failed_recipients.append({
+                        "email": recipient_email,
+                        "error": str(recipient_error)
+                    })
+                    print(f"Failed to send support visit report to {recipient_email}: {str(recipient_error)}")
+
+            server.quit()
+
+            if len(successful_recipients) == 0:
+                return jsonify({
+                    "success": False,
+                    "error": "Failed to send support visit report to all recipients",
+                    "failedTo": failed_recipients,
+                    "totalRecipients": len(emails)
+                }), 500
+
+            response = {
+                "success": True,
+                "message": f"Support visit report sent to {len(successful_recipients)} recipient(s)",
+                "totalRecipients": len(emails),
+                "successfulRecipients": len(successful_recipients),
+                "failedRecipients": len(failed_recipients),
+                "visitId": visit_id,
+            }
+
+            if failed_recipients:
+                response["failedTo"] = failed_recipients
+                return jsonify(response), 207
+
+            return jsonify(response), 200
+
+        except smtplib.SMTPAuthenticationError:
+            return jsonify({
+                "success": False,
+                "error": "SMTP authentication failed. Please check your email credentials."
+            }), 500
+
+        except smtplib.SMTPException as smtp_error:
+            return jsonify({
+                "success": False,
+                "error": f"SMTP error: {str(smtp_error)}"
+            }), 500
+
+    except Exception as e:
+        error_msg = f"Error sending support visit report: {str(e)}"
+        print(f"{error_msg}")
+        print(traceback.format_exc())
+        return jsonify({"success": False, "error": error_msg}), 500
+
