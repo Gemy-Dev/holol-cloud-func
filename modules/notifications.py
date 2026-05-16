@@ -252,7 +252,12 @@ def handle_send_notification(decoded_token, data, db):
 
         if notification_action:
             if isinstance(notification_action, dict):
-                message_data.update(notification_action)
+                import json
+                for k, v in notification_action.items():
+                    if isinstance(v, (dict, list)):
+                        message_data[str(k)] = json.dumps(v)
+                    else:
+                        message_data[str(k)] = str(v)
             else:
                 message_data["action"] = str(notification_action)
 
@@ -303,19 +308,30 @@ def handle_send_notification_to_all(decoded_token, data, db):
                 "error": "title and body are required"
             }), 400
         
+        # Get the sender's UID so we can exclude them from recipients
+        sender_id = data.get("senderId") or decoded_token.get("uid")
+        
         # Build message data
         message_data = {}
         if notification_action:
             if isinstance(notification_action, dict):
-                message_data.update(notification_action)
+                import json
+                for k, v in notification_action.items():
+                    if isinstance(v, (dict, list)):
+                        message_data[str(k)] = json.dumps(v)
+                    else:
+                        message_data[str(k)] = str(v)
             else:
                 message_data["action"] = str(notification_action)
         
-        # Get all users with FCM tokens
+        # Get all users with FCM tokens, excluding the sender
         users_ref = db.collection("users").stream()
         tokens = []
         
         for user_doc in users_ref:
+            # Skip the sender — they don't need their own notification
+            if sender_id and user_doc.id == sender_id:
+                continue
             user = user_doc.to_dict()
             fcm_token = user.get("fcmToken")
             if fcm_token:
@@ -327,7 +343,7 @@ def handle_send_notification_to_all(decoded_token, data, db):
                 "error": "No users with FCM tokens found"
             }), 404
         
-        print(f"📢 Sending notification to {len(tokens)} users")
+        print(f"📢 Sending notification to {len(tokens)} users (excluded sender: {sender_id})")
         
         # Build multicast message
         message = messaging.MulticastMessage(
@@ -340,7 +356,7 @@ def handle_send_notification_to_all(decoded_token, data, db):
         )
         
         try:
-            response = messaging.send_multicast(message)  # type: ignore[attr-defined]
+            response = messaging.send_each_for_multicast(message)  # type: ignore[attr-defined]
             success_count = response.success_count
             failure_count = response.failure_count
             

@@ -131,7 +131,7 @@ def _fetch_email_recipients(db):
         raise Exception(f"Failed to fetch email recipients from users collection: {str(e)}")
 
 
-def _fetch_recipients_by_permission(db):
+def _fetch_recipients_by_permission(db, permission):
     """Fetch recipients from email_recipients collection filtered by permission.
 
     Args:
@@ -151,7 +151,7 @@ def _fetch_recipients_by_permission(db):
         query = (
             db.collection("email_recipients")
             .where("isActive", "==", True)
-           
+            .where("permissions", "array_contains", permission)
             .stream()
         )
 
@@ -333,10 +333,10 @@ def send_email(title, body, db):
 
 
 def send_daily_report(data, db):
-    """Send daily report PDF via email.
+    """Send daily report PDF via email to users with receiveEmailNotifications enabled.
 
     Args:
-        data: Dictionary containing reportId, userName, date, pdfBase64, tasksCount, emails
+        data: Dictionary containing reportId, userId, userName, date, pdfBase64, tasksCount
         db: Firestore database instance
 
     Returns:
@@ -345,20 +345,20 @@ def send_daily_report(data, db):
     try:
         # Validate required fields
         report_id = data.get("reportId")
+        user_id = data.get("userId")
         user_name = data.get("userName", "")
         date = data.get("date", "")
         pdf_base64 = data.get("pdfBase64")
         tasks_count = data.get("tasksCount", 0)
-        emails = data.get("emails", [])
 
         if not report_id:
             return jsonify({"success": False, "error": "reportId is required"}), 400
 
+        if not user_id:
+            return jsonify({"success": False, "error": "userId is required"}), 400
+
         if not pdf_base64:
             return jsonify({"success": False, "error": "pdfBase64 is required"}), 400
-
-        if not emails or not isinstance(emails, list):
-            return jsonify({"success": False, "error": "emails is required and must be a list"}), 400
 
         # Validate email configuration
         config_valid, config_error = _check_email_config()
@@ -374,13 +374,27 @@ def send_daily_report(data, db):
         except Exception:
             return jsonify({"success": False, "error": "Invalid pdfBase64 data"}), 400
 
+        # Fetch recipients with receiveDailyReport permission from email_recipients collection
+        try:
+            recipients = _fetch_recipients_by_permission(db, "receiveDailyReport")
+        except Exception as e:
+            return jsonify({"success": False, "error": str(e)}), 500
+
+        if not recipients:
+            return jsonify({
+                "success": False,
+                "error": "No active recipients found with receiveDailyReport permission",
+                "totalRecipients": 0
+            }), 404
+
         # Build email subject and body
         subject = f"التقرير اليومي - {user_name} - {date}"
         body_text = (
             f"التقرير اليومي\n\n"
             f"الاسم: {user_name}\n"
             f"التاريخ: {date}\n"
-            f"عدد المهام: {tasks_count}\n"
+            f"عدد المهام: {tasks_count}\n\n"
+            f"يرجى الاطلاع على التقرير المرفق."
         )
 
         # Send email via SMTP
@@ -396,15 +410,18 @@ def send_daily_report(data, db):
             failed_recipients = []
             successful_recipients = []
 
-            for recipient_email in emails:
+            for recipient in recipients:
                 try:
+                    recipient_email = recipient["email"]
+                    recipient_name = recipient["name"]
+
                     msg = MIMEMultipart()
                     msg['From'] = f"{EMAIL_FROM_NAME} <{EMAIL_FROM_ADDRESS}>"
                     msg['To'] = recipient_email
                     msg['Subject'] = subject
 
                     # Personalized body with recipient name
-                    personalized_body = f"مرحباً ,\n\n{body_text}"
+                    personalized_body = f"مرحباً {recipient_name},\n\n{body_text}"
                     msg.attach(MIMEText(personalized_body, 'plain', 'utf-8'))
 
                     # Attach PDF
@@ -417,13 +434,13 @@ def send_daily_report(data, db):
 
                     server.sendmail(EMAIL_FROM_ADDRESS, recipient_email, msg.as_string())
                     successful_recipients.append(recipient_email)
-                    print(f"Daily report email sent to: {recipient_email}")
+                    print(f"Daily report email sent to: {recipient_name} <{recipient_email}>")
                 except Exception as recipient_error:
                     failed_recipients.append({
-                        "email": recipient_email,
+                        "email": recipient.get("email", ""),
                         "error": str(recipient_error)
                     })
-                    print(f"Failed to send daily report to {recipient_email}: {str(recipient_error)}")
+                    print(f"Failed to send daily report to {recipient.get('email', '')}: {str(recipient_error)}")
 
             server.quit()
 
@@ -432,13 +449,13 @@ def send_daily_report(data, db):
                     "success": False,
                     "error": "Failed to send daily report to all recipients",
                     "failedTo": failed_recipients,
-                    "totalRecipients": len(emails)
+                    "totalRecipients": len(recipients)
                 }), 500
 
             response = {
                 "success": True,
                 "message": f"Daily report sent to {len(successful_recipients)} recipient(s)",
-                "totalRecipients": len(emails),
+                "totalRecipients": len(recipients),
                 "successfulRecipients": len(successful_recipients),
                 "failedRecipients": len(failed_recipients),
             }
