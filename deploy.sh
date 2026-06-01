@@ -2,6 +2,9 @@
 
 echo "🚀 Starting deployment of Medical Advisor Cloud Functions..."
 
+# Add gcloud to PATH if installed via Homebrew
+export PATH="/opt/homebrew/share/google-cloud-sdk/bin:$PATH"
+
 # Check if gcloud is installed
 if ! command -v gcloud &> /dev/null; then
     echo "❌ Error: Google Cloud SDK (gcloud) is not installed"
@@ -93,14 +96,17 @@ deploy_main_function() {
         return 1
     fi
     
-    echo "✅ Deploying app.py with modular structure"
+    echo "✅ Deploying with modular structure"
     
-    # Create temporary main.py symlink for Cloud Functions deployment
-    # Cloud Functions expects main.py but we use app.py
-    echo "📝 Creating temporary main.py link..."
-    ln -sf app.py main.py
+    # main.py already exists with the entry point, no symlink needed
+    if [ ! -f "main.py" ]; then
+        echo "📝 Creating main.py symlink..."
+        ln -sf app.py main.py
+        CLEANUP_MAIN=true
+    else
+        CLEANUP_MAIN=false
+    fi
     
-    # Deploy using 'app' as entry point
     DEPLOY_RESULT=0
     gcloud functions deploy app \
         --gen2 \
@@ -112,15 +118,16 @@ deploy_main_function() {
         --allow-unauthenticated \
         --memory=1Gi \
         --timeout=540s \
-        --set-env-vars="GOOGLE_CLOUD_PROJECT=$PROJECT_ID,ALLOWED_ORIGINS=*" \
+        --set-env-vars="GOOGLE_CLOUD_PROJECT=$PROJECT_ID,ALLOWED_ORIGINS=*,EMAIL_SMTP_PASSWORD=dvgtizshxpxxefxn" \
         --max-instances=10 \
-        --min-instances=0  \
-  --set-env-vars EMAIL_SMTP_PASSWORD="dvgtizshxpxxefxn"
+        --min-instances=0
     
     DEPLOY_RESULT=$?
     
-    # Clean up symlink
-    rm -f main.py
+    # Clean up symlink only if we created it
+    if [ "$CLEANUP_MAIN" = true ]; then
+        rm -f main.py
+    fi
     
     if [ $DEPLOY_RESULT -eq 0 ]; then
         echo "✅ App function deployed successfully!"
@@ -245,7 +252,7 @@ main() {
         echo "🎉 Deployment completed successfully!"
         echo ""
         echo "📱 Your app API URL: https://us-central1-$PROJECT_ID.cloudfunctions.net/app"
-        echo "� Notifications run daily at 5 AM UTC (8 AM Iraq time)"
+        echo "  Notifications run daily at 5 AM UTC (8 AM Iraq time)"
         echo "🪣 Backup bucket: gs://$BACKUP_BUCKET"
         echo ""
         echo "🔐 Security: All functions require authentication"

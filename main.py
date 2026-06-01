@@ -15,6 +15,7 @@ from modules.tasks import (
     create_plan_tasks,
     create_tasks_for_new_client,
     create_tasks_from_product,
+    reconcile_client_tasks,
     get_task_stats,
     get_all_tasks_stats,
     get_completed_tasks_status,
@@ -155,8 +156,12 @@ def route_request(action, data, request):
     elif action == "createPlanTasks":
         return create_plan_tasks(data, db)
     
+    elif action == "syncTasksForClient":
+        return reconcile_client_tasks(data, db)
+
     elif action == "createTasksForNewClient":
-        return create_tasks_for_new_client(data, db)
+        # Back-compat alias: routes to the same reconcile handler
+        return reconcile_client_tasks(data, db)
     
     elif action == "createTasksFromProduct":
         return create_tasks_from_product(data, db)

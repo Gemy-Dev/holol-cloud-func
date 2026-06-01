@@ -4,6 +4,42 @@ from firebase_admin import firestore
 import traceback
 from datetime import datetime, timezone
 
+# ---------------------------------------------------------------------------
+# Reconcile helpers
+# ---------------------------------------------------------------------------
+
+def _extract_influencer_priority_map(client):
+    """Return a mapping of doctor name → priority string for all influencer
+    doctors on the client that have a non-empty name.
+
+    Args:
+        client: Client dict (includes 'additionalInfo.doctors[]').
+
+    Returns:
+        dict[str, str]  e.g. {"Dr. X": "A", "Dr. Y": "C"}
+    """
+    result = {}
+    additional_info = client.get("additionalInfo") or {}
+    for doctor in additional_info.get("doctors", []):
+        if not doctor.get("isInfluencer", False):
+            continue
+        name = doctor.get("name", "").strip()
+        if not name:
+            continue
+        priority = doctor.get("priority")
+        if isinstance(priority, dict):
+            priority = priority.get("name") or priority.get("value") or "C"
+        result[name] = priority or "C"
+    return result
+
+
+def _is_task_completed(task):
+    """Return True when a task's status represents a completed visit.
+
+    Matches both the wire value ('completed') and the Arabic display name.
+    """
+    return task.get("status") in ("completed", "مكتمل")
+
 
 def _fetch_eligible_clients(department_ids, cities, db):
     """Fetch eligible clients based on departments and cities.
@@ -298,20 +334,20 @@ def _extract_influencer_doctors(client):
         client: Client dictionary with additionalInfo
         
     Returns:
-        List of influencer doctor dictionaries with name, phone, email
+        List of influencer doctor dictionaries with name, phone, email, priority
     """
     influencer_doctors = []
-    
+
     # Check if client has additional info
     additional_info = client.get("additionalInfo")
     if not additional_info:
         return influencer_doctors
-    
+
     # Get doctors list from additional info
     doctors = additional_info.get("doctors", [])
     if not doctors:
         return influencer_doctors
-    
+
     # Filter for influencer doctors
     for doctor in doctors:
         is_influencer = doctor.get("isInfluencer", False)
@@ -319,9 +355,11 @@ def _extract_influencer_doctors(client):
             influencer_doctors.append({
                 "name": doctor.get("name", ""),
                 "phone": doctor.get("phone", ""),
-                "email": doctor.get("email", "")
+                "email": doctor.get("email", ""),
+                # Priority now lives on the influencer doctor (A/B/C), not the client
+                "priority": doctor.get("priority")
             })
-    
+
     return influencer_doctors
 
 
@@ -374,7 +412,7 @@ def _create_doctor_task(plan_id, plan_data, client, product, marketing_task, doc
         client: Client dictionary
         product: Product dictionary
         marketing_task: Marketing task (string or dict)
-        doctor: Doctor dictionary with name, phone, email
+        doctor: Doctor dictionary with name, phone, email, priority
         db: Firestore database instance
         
     Returns:
@@ -407,14 +445,16 @@ def _create_doctor_task(plan_id, plan_data, client, product, marketing_task, doc
         if list(existing_query):
             return False
         
-        # Get priority from client (handle both enum name and value)
-        client_priority = client.get("priority")
-        if isinstance(client_priority, dict):
-            priority_name = client_priority.get("name") or client_priority.get("value") or "medium"
-        elif isinstance(client_priority, str):
-            priority_name = client_priority
+        # Get priority from the influencer doctor (handle enum name/value or dict).
+        # Tasks are generated per influencer doctor, so the task priority must come
+        # from that doctor — not from the client (which no longer carries a priority).
+        doctor_priority = doctor.get("priority")
+        if isinstance(doctor_priority, dict):
+            priority_name = doctor_priority.get("name") or doctor_priority.get("value") or "C"
+        elif isinstance(doctor_priority, str) and doctor_priority:
+            priority_name = doctor_priority
         else:
-            priority_name = "c"  # Default priority
+            priority_name = "C"  # Default priority when the doctor has none
         
         # Create new task matching Flutter TaskModel structure with doctor info
         task_data = {
@@ -628,6 +668,281 @@ def create_plan_tasks(data, db):
                 "productIds": product_ids
             }
         }), 400
+
+
+def reconcile_client_tasks(data, db):
+    """Reconcile a client's planned tasks against its current influencer doctors.
+
+    For each call:
+      - R1: Completed tasks are never modified or deleted.
+      - R2: Not-completed tasks whose doctor's priority changed are updated.
+      - R3: Not-completed tasks already at the correct priority are left alone.
+      - R4: Not-completed tasks whose doctor was removed are soft-deleted.
+      - R0: Tasks with empty doctorName are not touched.
+      - R5: Missing tasks (new doctor, new plan, new product) are created.
+
+    All writes are committed in a single Firestore batch (chunked at ≤ 500 ops).
+    Completed tasks are never modified or deleted.
+
+    Also routes back-compat calls from the old 'createTasksForNewClient' action.
+
+    Args:
+        data: Request body dict with 'client' key.
+        db:   Firestore database instance.
+
+    Returns:
+        JSON response conforming to contracts/sync-tasks-for-client.md.
+    """
+    client_data = data.get("client")
+    if not client_data:
+        return jsonify({"error": "Client data is required", "success": False}), 400
+
+    client_id = client_data.get("id")
+    if not client_id:
+        return jsonify({"error": "Client ID is required", "success": False}), 400
+
+    client_city = client_data.get("city")
+    client_department = client_data.get("department")
+
+    if not client_city:
+        return jsonify({"error": "Client city is required", "success": False, "clientId": client_id}), 400
+    if not client_department:
+        return jsonify({"error": "Client department is required", "success": False, "clientId": client_id}), 400
+
+    # --- Counters ---
+    tasks_created = 0
+    tasks_updated = 0
+    tasks_deleted = 0
+    tasks_skipped = 0
+    completed_skipped = 0
+    matching_plans_count = 0
+
+    try:
+        # Build desired influencer map: { doctor_name: priority }
+        desired = _extract_influencer_priority_map(client_data)
+
+        # Fetch all existing tasks for this client, then drop soft-deleted ones
+        # in memory. Filtering reviewState here (instead of a second `!=` Firestore
+        # filter) avoids a composite-index requirement on (clientId, reviewState)
+        # and still includes legacy tasks that have no reviewState field.
+        existing_tasks = [
+            task_doc
+            for task_doc in db.collection("tasks")
+            .where("clientId", "==", client_id)
+            .stream()
+            if task_doc.to_dict().get("reviewState") != "deleted"
+        ]
+
+        # --- Phase 1: Reconcile existing tasks (R1-R4 + R0) ---
+        # Collect all batch operations; chunk at 499 writes
+        batch_ops = []   # list of (op, ref, data)
+
+        for task_doc in existing_tasks:
+            task = task_doc.to_dict()
+            task_ref = db.collection("tasks").document(task_doc.id)
+            doctor_name = task.get("doctorName", "")
+
+            # R0: empty doctorName → out of scope
+            if not doctor_name:
+                continue
+
+            # R1: completed tasks are immutable
+            if _is_task_completed(task):
+                completed_skipped += 1
+                continue
+
+            if doctor_name in desired:
+                current_priority = task.get("priority")
+                new_priority = desired[doctor_name]
+                if current_priority != new_priority:
+                    # R2: priority drift → update
+                    batch_ops.append(
+                        ("update", task_ref, {
+                            "priority": new_priority,
+                            "updatedAt": firestore.SERVER_TIMESTAMP,  # type: ignore[attr-defined]
+                        })
+                    )
+                    tasks_updated += 1
+                # else R3: no change needed
+            else:
+                # R4: doctor removed → soft-delete
+                batch_ops.append(
+                    ("update", task_ref, {
+                        "reviewState": "deleted",
+                        "updatedAt": firestore.SERVER_TIMESTAMP,  # type: ignore[attr-defined]
+                    })
+                )
+                tasks_deleted += 1
+
+        # --- Phase 2: Create missing tasks (R5) ---
+        # Find matching active plans (same logic as create_tasks_for_new_client)
+        matching_plans = []
+        try:
+            now = datetime.now(timezone.utc)
+            plans_query = (
+                db.collection("plans")
+                .where("cities", "array_contains", client_city)
+                .stream()
+            )
+            for plan_doc in plans_query:
+                plan = plan_doc.to_dict()
+                plan["id"] = plan_doc.id
+
+                # Skip expired plans
+                plan_end_date = plan.get("endDate")
+                if plan_end_date:
+                    if hasattr(plan_end_date, 'timestamp'):
+                        end_dt = datetime.fromtimestamp(plan_end_date.timestamp(), tz=timezone.utc)
+                    elif isinstance(plan_end_date, datetime):
+                        end_dt = plan_end_date if plan_end_date.tzinfo else plan_end_date.replace(tzinfo=timezone.utc)
+                    else:
+                        end_dt = None
+                    if end_dt and end_dt < now:
+                        continue
+
+                plan_departments = plan.get("departmentsIds", [])
+                if client_department not in plan_departments:
+                    continue
+
+                matching_plans.append(plan)
+
+        except Exception as query_error:
+            return jsonify({
+                "error": f"Failed to query plans: {str(query_error)}",
+                "success": False,
+                "clientId": client_id,
+            }), 500
+
+        matching_plans_count = len(matching_plans)
+
+        # Build the influencer doctors list for R5 (create path)
+        if desired:
+            doctors_to_process = [
+                {"name": name, "priority": priority}
+                for name, priority in desired.items()
+            ]
+        else:
+            doctors_to_process = [{"name": "", "priority": "C"}]
+
+        for plan in matching_plans:
+            plan_id = plan.get("id")
+            if not plan_id:
+                continue
+
+            target_product_sales = plan.get("targetProductSales", [])
+            product_ids = [
+                item["productId"] for item in target_product_sales
+                if isinstance(item, dict) and item.get("productId")
+            ]
+            if not product_ids:
+                continue
+
+            for product_id in product_ids:
+                product_doc = db.collection("products").document(product_id).get()
+                if not product_doc.exists:
+                    continue
+                product = product_doc.to_dict()
+                product["id"] = product_doc.id
+
+                product_departments = product.get("departmentsIds", [])
+                if client_department not in product_departments:
+                    continue
+
+                marketing_tasks = product.get("marketingTasks", [])
+                if not marketing_tasks:
+                    continue
+
+                for doctor in doctors_to_process:
+                    for marketing_task in marketing_tasks:
+                        marketing_task_name = (
+                            marketing_task.get("name") if isinstance(marketing_task, dict)
+                            else str(marketing_task)
+                        )
+                        existing_q = list(
+                            db.collection("tasks")
+                            .where("planId", "==", plan_id)
+                            .where("clientId", "==", client_id)
+                            .where("productId", "==", product["id"])
+                            .where("marketingTask", "==", marketing_task_name)
+                            .where("doctorName", "==", doctor.get("name", ""))
+                            .stream()
+                        )
+                        if existing_q:
+                            tasks_skipped += 1
+                            continue
+
+                        # R5: create new task
+                        task_data = {
+                            "taskType": "planned",
+                            "assignedToId": None,
+                            "planId": plan_id,
+                            "clientId": client_id,
+                            "targetDate": None,
+                            "productId": product["id"],
+                            "status": "pending",
+                            "cancelReason": None,
+                            "reviewState": "approved",
+                            "visitResult": None,
+                            "priority": doctor.get("priority", "C"),
+                            "note": None,
+                            "doctorName": doctor.get("name", ""),
+                            "createdAt": firestore.SERVER_TIMESTAMP,  # type: ignore[attr-defined]
+                            "updatedAt": firestore.SERVER_TIMESTAMP,  # type: ignore[attr-defined]
+                            "marketingTask": marketing_task_name,
+                        }
+                        new_ref = db.collection("tasks").document()
+                        batch_ops.append(("set", new_ref, task_data))
+                        tasks_created += 1
+
+            # Update plan.clientsIds
+            plan_clients_ids = plan.get("clientsIds", [])
+            if client_id not in plan_clients_ids:
+                plan_ref = db.collection("plans").document(plan_id)
+                batch_ops.append(
+                    ("update", plan_ref, {
+                        "clientsIds": firestore.ArrayUnion([client_id]),  # type: ignore[attr-defined]
+                    })
+                )
+
+        # --- Commit all batch ops (chunked at ≤ 499 per batch) ---
+        BATCH_LIMIT = 499
+        for i in range(0, max(1, len(batch_ops)), BATCH_LIMIT):
+            chunk = batch_ops[i:i + BATCH_LIMIT]
+            if not chunk:
+                break
+            batch = db.batch()
+            for op, ref, op_data in chunk:
+                if op == "update":
+                    batch.update(ref, op_data)
+                elif op == "set":
+                    batch.set(ref, op_data)
+            batch.commit()
+
+        return jsonify({
+            "success": True,
+            "clientId": client_id,
+            "message": (
+                f"Reconciled tasks for client: "
+                f"{tasks_created} created, {tasks_updated} updated, "
+                f"{tasks_deleted} deleted, {tasks_skipped} skipped"
+            ),
+            "tasksCreated": tasks_created,
+            "tasksUpdated": tasks_updated,
+            "tasksDeleted": tasks_deleted,
+            "tasksSkipped": tasks_skipped,
+            "completedSkipped": completed_skipped,
+            "matchingPlans": matching_plans_count,
+        })
+
+    except Exception as e:
+        error_msg = f"Failed to reconcile tasks for client: {str(e)}"
+        print(error_msg)
+        print(traceback.format_exc())
+        return jsonify({
+            "error": error_msg,
+            "success": False,
+            "clientId": client_id,
+        }), 500
 
 
 def create_tasks_for_new_client(data, db):

@@ -59,7 +59,14 @@ curl https://us-central1-medical-advisor-bd734.cloudfunctions.net/app
 - `getClients` - Get all clients
 
 ### Task Management
-- `createPlanTasks` - Create tasks from plan
+- `syncTasksForClient` - Reconcile a client's planned tasks with its current influencer doctors.
+  Performs create (missing tasks) + update (priority drift) + soft-delete (removed doctors) in a
+  single Firestore batch. Completed tasks are never modified or deleted.
+  **Replaces** the deprecated `createTasksForNewClient` action for both client create and update.
+- `createTasksForNewClient` - **Deprecated alias** for `syncTasksForClient`. Still routed to the
+  same reconcile handler for back-compatibility with older app builds.
+- `createPlanTasks` - Create tasks for all matching clients when a plan is first created
+- `createTasksFromProduct` - Create tasks when a new product is added to an existing plan
 
 ### Backup Operations
 - `manualBackup` - Trigger backup
