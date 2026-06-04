@@ -391,4 +391,3 @@ def handle_send_notification_to_all(decoded_token, data, db):
             "success": False,
             "error": error_msg
         }), 500
-

@@ -374,9 +374,14 @@ def send_daily_report(data, db):
         except Exception:
             return jsonify({"success": False, "error": "Invalid pdfBase64 data"}), 400
 
-        # Fetch recipients with receiveDailyReport permission from email_recipients collection
+        # Optional per-report customisation. When these fields are absent the
+        # email is byte-for-byte identical to the original daily report, so
+        # existing callers are unaffected.
+        report_permission = data.get("permission") or "receiveDailyReport"
+
+        # Fetch recipients with the requested permission from email_recipients
         try:
-            recipients = _fetch_recipients_by_permission(db, "receiveDailyReport")
+            recipients = _fetch_recipients_by_permission(db, report_permission)
         except Exception as e:
             return jsonify({"success": False, "error": str(e)}), 500
 
@@ -387,15 +392,16 @@ def send_daily_report(data, db):
                 "totalRecipients": 0
             }), 404
 
-        # Build email subject and body
-        subject = f"التقرير اليومي - {user_name} - {date}"
-        body_text = (
+        # Build email subject and body (overridable per report type)
+        subject = data.get("subject") or f"التقرير اليومي - {user_name} - {date}"
+        body_text = data.get("bodyText") or (
             f"التقرير اليومي\n\n"
             f"الاسم: {user_name}\n"
             f"التاريخ: {date}\n"
             f"عدد المهام: {tasks_count}\n\n"
             f"يرجى الاطلاع على التقرير المرفق."
         )
+        filename_prefix = data.get("filenamePrefix") or "report"
 
         # Send email via SMTP
         try:
@@ -426,7 +432,7 @@ def send_daily_report(data, db):
 
                     # Attach PDF
                     pdf_attachment = MIMEApplication(pdf_bytes, _subtype='pdf')
-                    pdf_filename = f"report_{user_name}_{date}.pdf"
+                    pdf_filename = f"{filename_prefix}_{user_name}_{date}.pdf"
                     pdf_attachment.add_header(
                         'Content-Disposition', 'attachment', filename=pdf_filename
                     )
