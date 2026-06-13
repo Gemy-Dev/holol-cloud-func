@@ -171,6 +171,33 @@ def _fetch_recipients_by_permission(db, permission):
         raise Exception(f"Failed to fetch email recipients: {str(e)}")
 
 
+def _fetch_recipient_names(db):
+    """Return a mapping of lowercased email -> recipient name.
+
+    Used to personalise emails when the caller supplies an explicit list of
+    recipient addresses (the in-app recipients picker) rather than relying on a
+    permission-based mailing list. Best effort: failures yield an empty map so
+    the email is still sent (just without a personalised greeting).
+
+    Args:
+        db: Firestore database instance
+
+    Returns:
+        dict: {email_lowercased: name}
+    """
+    names = {}
+    try:
+        for doc in db.collection("email_recipients").stream():
+            data = doc.to_dict()
+            email = data.get("email", "")
+            name = data.get("name", "")
+            if email and isinstance(email, str):
+                names[email.strip().lower()] = name
+    except Exception as e:
+        print(f"Could not fetch recipient names for personalisation: {str(e)}")
+    return names
+
+
 def send_email(title, body, db):
     """Send email with title and body to users with receiveEmailNotifications enabled.
     
@@ -379,11 +406,56 @@ def send_daily_report(data, db):
         # existing callers are unaffected.
         report_permission = data.get("permission") or "receiveDailyReport"
 
-        # Fetch recipients with the requested permission from email_recipients
-        try:
-            recipients = _fetch_recipients_by_permission(db, report_permission)
-        except Exception as e:
-            return jsonify({"success": False, "error": str(e)}), 500
+        # When the caller supplies an explicit list of recipient emails (the
+        # in-app recipients picker), honour that selection instead of the
+        # permission-based mailing list. Falls back to the permission list when
+        # no emails are provided, so existing callers keep working unchanged.
+        explicit_emails = data.get("emails")
+        if explicit_emails:
+            if not isinstance(explicit_emails, list):
+                return jsonify({
+                    "success": False,
+                    "error": "emails must be a list of email addresses"
+                }), 400
+
+            # Validate and de-duplicate the requested addresses.
+            seen = set()
+            cleaned_emails = []
+            invalid_emails = []
+            for raw in explicit_emails:
+                if not isinstance(raw, str):
+                    invalid_emails.append(str(raw))
+                    continue
+                email = raw.strip()
+                if not email:
+                    continue
+                if not _validate_email(email):
+                    invalid_emails.append(email)
+                    continue
+                key = email.lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+                cleaned_emails.append(email)
+
+            if invalid_emails:
+                return jsonify({
+                    "success": False,
+                    "error": f"Invalid email addresses: {', '.join(invalid_emails)}"
+                }), 400
+
+            # Best-effort name lookup so the greeting stays personalised.
+            names_by_email = _fetch_recipient_names(db)
+            recipients = [
+                {"email": email, "name": names_by_email.get(email.lower(), "")}
+                for email in cleaned_emails
+            ]
+        else:
+            # Fetch recipients with the requested permission from email_recipients
+            try:
+                recipients = _fetch_recipients_by_permission(db, report_permission)
+            except Exception as e:
+                return jsonify({"success": False, "error": str(e)}), 500
 
         if not recipients:
             return jsonify({
@@ -426,8 +498,12 @@ def send_daily_report(data, db):
                     msg['To'] = recipient_email
                     msg['Subject'] = subject
 
-                    # Personalized body with recipient name
-                    personalized_body = f"مرحباً {recipient_name},\n\n{body_text}"
+                    # Personalized body with recipient name (skip the greeting
+                    # when we have no name for a hand-picked recipient).
+                    if recipient_name:
+                        personalized_body = f"مرحباً {recipient_name},\n\n{body_text}"
+                    else:
+                        personalized_body = body_text
                     msg.attach(MIMEText(personalized_body, 'plain', 'utf-8'))
 
                     # Attach PDF
