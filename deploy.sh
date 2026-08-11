@@ -190,27 +190,31 @@ setup_schedulers() {
             --project=$PROJECT_ID
     fi
     
-    # Setup test notifications scheduler (every 1 minute - FOR TESTING ONLY)
-    if gcloud scheduler jobs describe test-notifications --location=$REGION --project=$PROJECT_ID &>/dev/null; then
-        echo "📝 Updating test notifications scheduler..."
-        gcloud scheduler jobs update http test-notifications \
-            --schedule="* * * * *" \
+    # Tomorrow's tasks: 17:00 UTC = 20:00 Iraq time, the second half of
+    # handle_daily_notifications' documented schedule (days_offset=1).
+    # Same no-dedupe caveat as above — this must stay once a day.
+    if gcloud scheduler jobs describe notify-tomorrow-tasks --location=$REGION --project=$PROJECT_ID &>/dev/null; then
+        echo "📝 Updating tomorrow-tasks scheduler..."
+        gcloud scheduler jobs update http notify-tomorrow-tasks \
+            --schedule="0 17 * * *" \
             --uri="$FUNCTION_URL" \
             --http-method=POST \
-            --message-body='{"action":"test_notification_to_all"}' \
+            --headers="Content-Type=application/json" \
+            --message-body='{"action":"notify_tomorrow_tasks"}' \
             --time-zone="UTC" \
             --location=$REGION \
             --project=$PROJECT_ID
     else
-        echo "🆕 Creating test notifications scheduler..."
-        gcloud scheduler jobs create http test-notifications \
-            --schedule="* * * * *" \
+        echo "🆕 Creating tomorrow-tasks scheduler..."
+        gcloud scheduler jobs create http notify-tomorrow-tasks \
+            --schedule="0 17 * * *" \
             --uri="$FUNCTION_URL" \
             --http-method=POST \
-            --message-body='{"action":"test_notification_to_all"}' \
+            --headers="Content-Type=application/json" \
+            --message-body='{"action":"notify_tomorrow_tasks"}' \
             --time-zone="UTC" \
             --location=$REGION \
-            --description="Test notifications every minute (FOR TESTING ONLY)" \
+            --description="Tomorrow's task notifications daily at 20:00 Iraq time" \
             --project=$PROJECT_ID
     fi
     
