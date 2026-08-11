@@ -41,6 +41,78 @@ def _is_task_completed(task):
     return task.get("status") in ("completed", "مكتمل")
 
 
+def _task_is_protected(task):
+    """Return True when a task holds real fieldwork and must never be deleted.
+
+    A task is protected when it is completed, or when a sales rep already
+    recorded a visit result on it (whatever its current status).
+    """
+    return _is_task_completed(task) or task.get("visitResult") is not None
+
+
+def _marketing_task_name(marketing_task):
+    """Normalise a marketing task (string or dict) to its comparable name."""
+    if isinstance(marketing_task, dict):
+        return (
+            marketing_task.get("name")
+            or marketing_task.get("id")
+            or str(marketing_task)
+        )
+    return str(marketing_task)
+
+
+def _task_identity_key(plan_id, client_id, product_id, marketing_task_name, doctor_name):
+    """Return the tuple that uniquely identifies a planned task.
+
+    Mirrors the duplicate-check query in `_create_doctor_task` so callers can
+    dedupe in memory instead of issuing one Firestore query per combination.
+    """
+    return (
+        plan_id,
+        client_id,
+        product_id,
+        marketing_task_name,
+        doctor_name or "",
+    )
+
+
+def _doctor_priority_name(doctor):
+    """Return the A/B/C priority for an influencer doctor.
+
+    Tasks are generated per influencer doctor, so the task priority must come
+    from that doctor — not from the client (which no longer carries a priority).
+    Handles enum name/value dicts and falls back to 'C'.
+    """
+    priority = doctor.get("priority")
+    if isinstance(priority, dict):
+        return priority.get("name") or priority.get("value") or "C"
+    if isinstance(priority, str) and priority:
+        return priority
+    return "C"
+
+
+def _build_planned_task_payload(plan_id, client_id, product_id, marketing_task_name, doctor):
+    """Build a planned task document matching the Flutter TaskModel structure."""
+    return {
+        "taskType": "planned",  # TaskType.planned.value
+        "assignedToId": None,
+        "planId": plan_id,
+        "clientId": client_id,
+        "targetDate": None,  # Optional, can be set later
+        "productId": product_id,
+        "status": "pending",  # Default status (TaskStatus enum)
+        "cancelReason": None,  # Optional
+        "reviewState": "approved",  # Default review state (ReviewState enum)
+        "visitResult": None,  # Optional
+        "priority": _doctor_priority_name(doctor),
+        "note": None,  # Optional
+        "doctorName": doctor.get("name", ""),  # Doctor name from influencer doctor
+        "createdAt": firestore.SERVER_TIMESTAMP,  # type: ignore[attr-defined]
+        "updatedAt": firestore.SERVER_TIMESTAMP,  # type: ignore[attr-defined]
+        "marketingTask": marketing_task_name,  # Stored as string to match duplicate check query
+    }
+
+
 def _fetch_eligible_clients(department_ids, cities, db):
     """Fetch eligible clients based on departments and cities.
     
@@ -422,13 +494,8 @@ def _create_doctor_task(plan_id, plan_data, client, product, marketing_task, doc
         Exception: If task creation fails
     """
     # Extract marketing task name for comparison
-    if isinstance(marketing_task, dict):
-        marketing_task_name = marketing_task.get("name") or marketing_task.get("id") or str(marketing_task)
-        marketing_task_data = marketing_task
-    else:
-        marketing_task_name = str(marketing_task)
-        marketing_task_data = marketing_task if marketing_task else {}
-    
+    marketing_task_name = _marketing_task_name(marketing_task)
+
     try:
         # Check if task already exists for this doctor + product + marketing task combination
         existing_query = (
@@ -444,38 +511,16 @@ def _create_doctor_task(plan_id, plan_data, client, product, marketing_task, doc
         
         if list(existing_query):
             return False
-        
-        # Get priority from the influencer doctor (handle enum name/value or dict).
-        # Tasks are generated per influencer doctor, so the task priority must come
-        # from that doctor — not from the client (which no longer carries a priority).
-        doctor_priority = doctor.get("priority")
-        if isinstance(doctor_priority, dict):
-            priority_name = doctor_priority.get("name") or doctor_priority.get("value") or "C"
-        elif isinstance(doctor_priority, str) and doctor_priority:
-            priority_name = doctor_priority
-        else:
-            priority_name = "C"  # Default priority when the doctor has none
-        
+
         # Create new task matching Flutter TaskModel structure with doctor info
-        task_data = {
-            "taskType": "planned",  # TaskType.planned.value
-            "assignedToId": None,
-            "planId": plan_id,
-            "clientId": client["id"],
-            "targetDate": None,  # Optional, can be set later
-            "productId": product["id"],
-            "status": "pending",  # Default status (TaskStatus enum)
-            "cancelReason": None,  # Optional
-            "reviewState": "approved",  # Default review state (ReviewState enum)
-            "visitResult": None,  # Optional
-            "priority": priority_name,
-            "note": None,  # Optional
-            "doctorName": doctor.get("name", ""),  # Doctor name from influencer doctor
-            "createdAt": firestore.SERVER_TIMESTAMP,  # type: ignore[attr-defined]
-            "updatedAt": firestore.SERVER_TIMESTAMP,  # type: ignore[attr-defined]
-            "marketingTask": marketing_task_name,  # Store as string to match duplicate check query
-        }
-        
+        task_data = _build_planned_task_payload(
+            plan_id,
+            client["id"],
+            product["id"],
+            marketing_task_name,
+            doctor,
+        )
+
         task_ref = db.collection("tasks").document()
         task_ref.set(task_data)
         
@@ -483,6 +528,82 @@ def _create_doctor_task(plan_id, plan_data, client, product, marketing_task, doc
         
     except Exception as e:
         raise Exception(f"Failed to create task for doctor {doctor.get('name')}, client {client.get('id')}, product {product.get('id')}: {str(e)}")
+
+
+def _validate_plan_payload(data):
+    """Validate the 'plan' entry of a request body and extract its task criteria.
+
+    Args:
+        data: Request body dict expected to carry a 'plan' key.
+
+    Returns:
+        Tuple of (context, error). On success `context` is a dict with keys
+        planData / planId / productIds / cities / departments and `error` is
+        None. On failure `context` is None and `error` is a (response, status)
+        tuple ready to be returned to the caller.
+    """
+    plan_data = data.get("plan")
+    if not plan_data:
+        return None, (jsonify({
+            "error": "Plan data is required",
+            "success": False
+        }), 400)
+
+    plan_id = plan_data.get("id")
+    if not plan_id or plan_id == "":
+        return None, (jsonify({
+            "error": "Plan ID is required and must not be empty",
+            "success": False
+        }), 400)
+
+    # Extract product IDs from plan.targetProductSales
+    target_product_sales = plan_data.get("targetProductSales", [])
+    if not target_product_sales:
+        return None, (jsonify({
+            "error": "Plan has no target products",
+            "success": False,
+            "planId": plan_id
+        }), 400)
+
+    product_ids = []
+    for item in target_product_sales:
+        if isinstance(item, dict):
+            product_id = item.get("productId")
+            if product_id:
+                product_ids.append(product_id)
+
+    if not product_ids:
+        return None, (jsonify({
+            "error": "No effective product IDs found in targetProductSales",
+            "success": False,
+            "planId": plan_id
+        }), 400)
+
+    # Extract client criteria from plan
+    plan_cities = plan_data.get("cities", [])
+    plan_departments = plan_data.get("departmentsIds", [])
+
+    if not plan_departments:
+        return None, (jsonify({
+            "error": "Plan has no departments",
+            "success": False,
+            "planId": plan_id
+        }), 400)
+
+    if not plan_cities:
+        return None, (jsonify({
+            "error": "Plan has no cities",
+            "success": False,
+            "planId": plan_id
+        }), 400)
+
+    return {
+        "planData": plan_data,
+        "planId": plan_id,
+        "productIds": product_ids,
+        "cities": plan_cities,
+        "departments": plan_departments,
+    }, None
 
 
 def create_plan_tasks(data, db):
@@ -504,61 +625,16 @@ def create_plan_tasks(data, db):
         JSON response with success status and created tasks
     """
     # Extract and validate plan data
-    plan_data = data.get("plan")
-    if not plan_data:
-        return jsonify({
-            "error": "Plan data is required",
-            "success": False
-        }), 400
-    
-    plan_id = plan_data.get("id")
-    if not plan_id or plan_id == "":
-        return jsonify({
-            "error": "Plan ID is required and must not be empty",
-            "success": False
-        }), 400
-    
-    # Extract product IDs from plan.targetProductsSales
-    target_product_sales = plan_data.get("targetProductSales", [])
-    if not target_product_sales:
-        return jsonify({
-            "error": "Plan has no target products",
-            "success": False,
-            "planId": plan_id
-        }), 400
-    
-    product_ids = []
-    for item in target_product_sales:
-        if isinstance(item, dict):
-            product_id = item.get("productId")
-            if product_id:
-                product_ids.append(product_id)
-    
-    if not product_ids:
-        return jsonify({
-            "error": "No effective product IDs found in targetProductSales",
-            "success": False,
-            "planId": plan_id
-        }), 400
-    
-    # Extract client criteria from plan
-    plan_cities = plan_data.get("cities", [])
-    plan_departments = plan_data.get("departmentsIds", [])
-    
-    if not plan_departments:
-        return jsonify({
-            "error": "Plan has no departments",
-            "success": False,
-            "planId": plan_id
-        }), 400
-    
-    if not plan_cities:
-        return jsonify({
-            "error": "Plan has no cities",
-            "success": False,
-            "planId": plan_id
-        }), 400
-    
+    plan, error = _validate_plan_payload(data)
+    if error:
+        return error
+
+    plan_data = plan["planData"]
+    plan_id = plan["planId"]
+    product_ids = plan["productIds"]
+    plan_cities = plan["cities"]
+    plan_departments = plan["departments"]
+
     try:
         # Fetch products - will throw exception if not found
         products = _fetch_target_products_simple(product_ids, db)
@@ -658,6 +734,196 @@ def create_plan_tasks(data, db):
         
     except Exception as e:
         error_msg = str(e)
+        return jsonify({
+            "error": error_msg,
+            "success": False,
+            "planId": plan_id,
+            "details": {
+                "departments": plan_departments,
+                "cities": plan_cities,
+                "productIds": product_ids
+            }
+        }), 400
+
+
+def regenerate_plan_tasks(data, db):
+    """Wipe and recreate a plan's tasks after the plan was edited.
+
+    Called when a planner edits a plan's targeting data (cities, departments or
+    target products). Tasks generated from the previous data would otherwise
+    live on forever, so the whole task set is rebuilt from the new plan:
+
+      - Tasks holding real fieldwork are protected and left untouched:
+        completed tasks, and any task carrying a visitResult.
+      - Every other task of the plan is hard-deleted.
+      - The full task set is then regenerated from the plan's current cities /
+        departments / products, skipping combinations already covered by a
+        protected task so nothing is duplicated.
+
+    Deletes and creates are collected first and committed together in batches of
+    at most 499 writes, so a mid-way failure cannot leave the plan emptied.
+
+    Args:
+        data: Request body dict with a 'plan' key.
+        db:   Firestore database instance.
+
+    Returns:
+        JSON response with the delete/create counts.
+    """
+    plan, error = _validate_plan_payload(data)
+    if error:
+        return error
+
+    plan_id = plan["planId"]
+    product_ids = plan["productIds"]
+    plan_cities = plan["cities"]
+    plan_departments = plan["departments"]
+
+    try:
+        # --- Phase 1: partition the plan's existing tasks ---
+        protected_keys = set()
+        protected_client_ids = set()
+        protected_count = 0
+        doomed_refs = []
+
+        for task_doc in db.collection("tasks").where("planId", "==", plan_id).stream():
+            task = task_doc.to_dict()
+            if _task_is_protected(task):
+                protected_count += 1
+                protected_keys.add(
+                    _task_identity_key(
+                        plan_id,
+                        task.get("clientId"),
+                        task.get("productId"),
+                        task.get("marketingTask"),
+                        task.get("doctorName"),
+                    )
+                )
+                client_id = task.get("clientId")
+                if client_id:
+                    protected_client_ids.add(client_id)
+            else:
+                doomed_refs.append(db.collection("tasks").document(task_doc.id))
+
+        # --- Phase 2: rebuild the desired task set from the plan's new data ---
+        # Both raise a detailed exception when nothing matches.
+        products = _fetch_target_products_simple(product_ids, db)
+        clients = _fetch_eligible_clients(plan_departments, plan_cities, db)
+
+        client_ids = [client["id"] for client in clients]
+
+        batch_ops = [("delete", ref, None) for ref in doomed_refs]
+        created_count = 0
+        skipped_count = 0
+        clients_without_doctors = 0
+        total_influencer_doctors = 0
+
+        for client in clients:
+            influencer_doctors = _extract_influencer_doctors(client)
+
+            # If no influencer doctors, create tasks without doctor info
+            if not influencer_doctors:
+                clients_without_doctors += 1
+                doctors_to_process = [{"name": "", "phone": "", "email": ""}]
+            else:
+                doctors_to_process = influencer_doctors
+
+            total_influencer_doctors += len(influencer_doctors)
+
+            client_department = client.get("department")
+
+            for doctor in doctors_to_process:
+                for product in products:
+                    # Only create tasks if client's department matches product's departments
+                    product_departments = product.get("departmentsIds", [])
+                    if client_department and product_departments and client_department not in product_departments:
+                        continue
+
+                    marketing_tasks = product.get("marketingTasks", [])
+                    if not marketing_tasks:
+                        continue
+
+                    for marketing_task in marketing_tasks:
+                        marketing_task_name = _marketing_task_name(marketing_task)
+                        key = _task_identity_key(
+                            plan_id,
+                            client["id"],
+                            product["id"],
+                            marketing_task_name,
+                            doctor.get("name", ""),
+                        )
+                        # A protected task already covers this combination.
+                        if key in protected_keys:
+                            skipped_count += 1
+                            continue
+
+                        task_data = _build_planned_task_payload(
+                            plan_id,
+                            client["id"],
+                            product["id"],
+                            marketing_task_name,
+                            doctor,
+                        )
+                        batch_ops.append(
+                            ("set", db.collection("tasks").document(), task_data)
+                        )
+                        created_count += 1
+
+        # --- Phase 3: commit deletes and creates together (chunked at <= 499) ---
+        BATCH_LIMIT = 499
+        for i in range(0, len(batch_ops), BATCH_LIMIT):
+            chunk = batch_ops[i:i + BATCH_LIMIT]
+            batch = db.batch()
+            for op, ref, op_data in chunk:
+                if op == "delete":
+                    batch.delete(ref)
+                elif op == "set":
+                    batch.set(ref, op_data)
+            batch.commit()
+
+        # --- Phase 4: refresh the plan's denormalised counters ---
+        # Clients of protected tasks stay in clientsIds even when they no longer
+        # match the plan's targeting: the dashboards use clientsIds as the
+        # denominator for completed-client KPIs, so dropping them would skew it.
+        matched_client_ids = set(client_ids)
+        merged_client_ids = client_ids + [
+            cid for cid in sorted(protected_client_ids) if cid not in matched_client_ids
+        ]
+        tasks_count = protected_count + created_count
+        try:
+            plan_ref = db.collection("plans").document(plan_id)
+            plan_ref.update({
+                "clientsIds": merged_client_ids,
+                "tasksCount": tasks_count,
+                "updatedAt": firestore.SERVER_TIMESTAMP,  # type: ignore[attr-defined]
+            })
+        except Exception as update_error:
+            # Log but don't fail: the tasks themselves are already correct.
+            print(f"⚠️ Warning: Failed to update plan counters: {str(update_error)}")
+
+        return jsonify({
+            "success": True,
+            "message": (
+                f"Regenerated plan tasks: {len(doomed_refs)} deleted, "
+                f"{created_count} created, {protected_count} protected"
+            ),
+            "planId": plan_id,
+            "tasksDeleted": len(doomed_refs),
+            "tasksProtected": protected_count,
+            "tasksCreated": created_count,
+            "tasksSkipped": skipped_count,
+            "tasksCount": tasks_count,
+            "clientsProcessed": len(clients),
+            "clientsIds": merged_client_ids,
+            "clientsWithoutInfluencerDoctors": clients_without_doctors,
+            "influencerDoctorsProcessed": total_influencer_doctors,
+            "productsProcessed": len(products),
+        })
+
+    except Exception as e:
+        error_msg = str(e)
+        print(f"Failed to regenerate tasks for plan {plan_id}: {error_msg}")
+        print(traceback.format_exc())
         return jsonify({
             "error": error_msg,
             "success": False,
@@ -1768,7 +2034,7 @@ def get_completed_tasks_status(db):
         }), 500
 
 
-def get_tasks_by_date_range(data, decoded_token, db):
+def get_tasks_by_d00000000ate_range(data, decoded_token, db):
     """Get tasks within a specific date range.
     
     Args:
@@ -1910,4 +2176,218 @@ def get_tasks_by_date_range(data, decoded_token, db):
             "error": f"Failed to get tasks: {str(e)}",
             "success": False
         }), 500
+
+
+def get_tasks_paginated(data, db):
+    """Retrieve tasks with pagination and custom filtering.
+    
+    To avoid complex index requirements, we fetch tasks by planId,
+    and then filter, sort, and paginate them in memory.
+    """
+    try:
+        plan_id = data.get("planId")
+        if not plan_id:
+            return jsonify({"error": "planId is required", "success": False}), 400
+
+        task_type = data.get("taskType")
+        page_size = data.get("pageSize", 20)
+        last_document = data.get("lastDocument")  # offset index or taskId string
+        target_date_filter = data.get("targetDateFilter", "all")
+        
+        # Filters
+        filter_client_id = data.get("filterClientId")
+        filter_product_id = data.get("filterProductId")
+        filter_status = data.get("filterStatus")
+        filter_priority = data.get("filterPriority")
+        filter_city = data.get("filterCity")
+        filter_city_client_ids = data.get("filterCityClientIds")
+
+        # Resolve city in backend if filterCity is provided
+        if filter_city:
+            try:
+                city_clients = db.collection("clients").where("city", "==", filter_city).stream()
+                resolved_ids = [doc.id for doc in city_clients]
+                if filter_city_client_ids is None:
+                    filter_city_client_ids = resolved_ids
+                else:
+                    filter_city_client_ids = list(set(filter_city_client_ids).intersection(set(resolved_ids)))
+            except Exception as e:
+                print(f"Error resolving city clients: {e}")
+
+        # Check if any user filter is active
+        has_active_filter = bool(
+            filter_client_id or
+            filter_product_id or
+            filter_status or
+            filter_priority or
+            filter_city or
+            filter_city_client_ids is not None
+        )
+
+        # Query all tasks for the plan
+        tasks_query = (
+            db.collection("tasks")
+            .where("planId", "==", plan_id)
+            .stream()
+        )
+        
+        all_tasks = []
+        for doc in tasks_query:
+            task = doc.to_dict()
+            if task.get("reviewState") == "deleted":
+                continue
+            task["id"] = doc.id
+            all_tasks.append(task)
+
+        # Apply filters in memory
+        filtered_tasks = []
+        for task in all_tasks:
+            # TaskType filter
+            if task_type and task.get("taskType") != task_type:
+                continue
+
+            # TargetDate filter
+            target_date = task.get("targetDate")
+            # Ignore targetDateFilter if any user filter is active
+            if not has_active_filter:
+                if target_date_filter == "withDate" and target_date is None:
+                    continue
+                elif target_date_filter == "withoutDate" and target_date is not None:
+                    continue
+
+            # Client ID filter
+            if filter_client_id and task.get("clientId") != filter_client_id:
+                continue
+
+            # Product ID filter
+            if filter_product_id and task.get("productId") != filter_product_id:
+                continue
+
+            # Status filter
+            if filter_status:
+                task_status = task.get("status") or "pending"
+                completed_aliases = {"completed", "مكتمل"}
+                pending_aliases = {"pending", "قيد الانجاز", "قيد الإنجاز"}
+                canceled_aliases = {"canceled", "cancelled", "ملغي"}
+                reset_aliases = {"reset", "إعادة تعيين", "اعادة تعيين"}
+                
+                f_status = str(filter_status).strip().lower()
+                t_status = str(task_status).strip().lower()
+                
+                is_match = False
+                if f_status in completed_aliases:
+                    is_match = t_status in completed_aliases
+                elif f_status in pending_aliases:
+                    is_match = t_status in pending_aliases
+                elif f_status in canceled_aliases:
+                    is_match = t_status in canceled_aliases
+                elif f_status in reset_aliases:
+                    is_match = t_status in reset_aliases
+                else:
+                    is_match = (t_status == f_status)
+                
+                if not is_match:
+                    continue
+
+            # Priority filter
+            if filter_priority:
+                task_priority = task.get("priority")
+                high_aliases = {"a", "high"}
+                medium_aliases = {"b", "medium"}
+                low_aliases = {"c", "low"}
+                
+                f_pri = str(filter_priority).strip().lower()
+                t_pri = str(task_priority or "").strip().lower()
+                
+                is_match = False
+                if f_pri in high_aliases:
+                    is_match = t_pri in high_aliases
+                elif f_pri in medium_aliases:
+                    is_match = t_pri in medium_aliases
+                elif f_pri in low_aliases:
+                    is_match = t_pri in low_aliases
+                else:
+                    is_match = (t_pri == f_pri)
+                
+                if not is_match:
+                    continue
+
+            # City filter (pre-resolved client IDs list)
+            if filter_city_client_ids is not None:
+                if not filter_city_client_ids:
+                    # If empty client IDs list, no tasks can match
+                    continue
+                if task.get("clientId") not in filter_city_client_ids:
+                    continue
+
+            filtered_tasks.append(task)
+
+        # Helper to parse targetDate / createdAt for sorting
+        def parse_datetime(val):
+            if not val:
+                return datetime.min
+            if isinstance(val, datetime):
+                return val
+            if isinstance(val, str):
+                try:
+                    return datetime.fromisoformat(val.replace("Z", "+00:00"))
+                except Exception:
+                    pass
+            return datetime.min
+
+        # Sort tasks descending by createdAt, and then by document id
+        filtered_tasks.sort(
+            key=lambda t: (parse_datetime(t.get("createdAt")), t.get("id", "")),
+            reverse=True
+        )
+
+        # Paginate
+        start_index = 0
+        if last_document:
+            try:
+                start_index = int(last_document)
+            except ValueError:
+                # If last_document is a taskId string
+                start_index = -1
+                for idx, t in enumerate(filtered_tasks):
+                    if t.get("id") == last_document:
+                        start_index = idx + 1
+                        break
+                if start_index == -1:
+                    start_index = 0
+
+        paginated_tasks = filtered_tasks[start_index : start_index + page_size]
+        has_more = (start_index + page_size) < len(filtered_tasks)
+        
+        next_last_document = None
+        if paginated_tasks:
+            next_last_document = paginated_tasks[-1].get("id")
+
+        # Convert datetime objects to string representation for serialization
+        def serialize_item(item):
+            if isinstance(item, datetime):
+                return item.isoformat()
+            if isinstance(item, dict):
+                return {k: serialize_item(v) for k, v in item.items()}
+            if isinstance(item, list):
+                return [serialize_item(v) for v in item]
+            return item
+
+        serialized_tasks = serialize_item(paginated_tasks)
+
+        return jsonify({
+            "success": True,
+            "tasks": serialized_tasks,
+            "hasMore": has_more,
+            "lastDocument": next_last_document
+        }), 200
+
+    except Exception as e:
+        print(f"Error in get_tasks_paginated: {str(e)}")
+        traceback.print_exc()
+        return jsonify({
+            "error": f"Failed to get tasks: {str(e)}",
+            "success": False
+        }), 500
+
 

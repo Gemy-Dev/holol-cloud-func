@@ -41,6 +41,9 @@ class _FakeDocRef:
         doc = self._store.get(self._collection, {}).get(self._doc_id)
         return _FakeDocSnapshot(self._doc_id, doc)
 
+    def delete(self):
+        self._store.setdefault(self._collection, {}).pop(self._doc_id, None)
+
 
 class _FakeDocSnapshot:
     def __init__(self, doc_id: str, data: Optional[dict]):
@@ -154,12 +157,17 @@ class _FakeBatch:
     def set(self, ref: _FakeDocRef, data: dict):
         self.operations.append(('set', ref, data))
 
+    def delete(self, ref: _FakeDocRef):
+        self.operations.append(('delete', ref, None))
+
     def commit(self):
         for op, ref, data in self.operations:
             if op == 'update':
                 ref.update(data)
             elif op == 'set':
                 ref.set(data)
+            elif op == 'delete':
+                ref.delete()
 
 
 class FakeFirestore:

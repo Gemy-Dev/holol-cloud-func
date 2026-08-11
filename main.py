@@ -13,13 +13,15 @@ from modules.users import create_user, update_user, delete_user
 from modules.products import get_products, get_plan_products, get_clients, delete_client_and_tasks
 from modules.tasks import (
     create_plan_tasks,
+    regenerate_plan_tasks,
     create_tasks_for_new_client,
     create_tasks_from_product,
     reconcile_client_tasks,
     get_task_stats,
     get_all_tasks_stats,
     get_completed_tasks_status,
-    get_tasks_by_date_range
+    get_tasks_by_date_range,
+    get_tasks_paginated
 )
 from modules.backups import (
     handle_manual_backup,
@@ -155,7 +157,11 @@ def route_request(action, data, request):
 
     elif action == "createPlanTasks":
         return create_plan_tasks(data, db)
-    
+
+    elif action == "updatePlanTasks":
+        # Plan was edited: wipe non-protected tasks and rebuild from new data
+        return regenerate_plan_tasks(data, db)
+
     elif action == "syncTasksForClient":
         return reconcile_client_tasks(data, db)
 
@@ -171,6 +177,9 @@ def route_request(action, data, request):
 
     elif action == "getTasksByDateRange":
         return get_tasks_by_date_range(data, decoded_token, db)
+
+    elif action == "getTasks":
+        return get_tasks_paginated(data, db)
     
     # Backup actions (admin only)
     elif action == "manualBackup":
