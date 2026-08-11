@@ -21,9 +21,9 @@ if ! command -v gsutil &> /dev/null; then
 fi
 
 # Set your project ID (replace with your actual project ID)
-PROJECT_ID="medical-advisor-bd734"
+PROJECT_ID="test-medical-80e1b"
 REGION="us-central1"
-BACKUP_BUCKET="${PROJECT_ID}-backups"
+BACKUP_BUCKET="${PROJECT_ID}-firestore-backups"
 
 echo "🔧 Setting project configuration..."
 gcloud config set project $PROJECT_ID

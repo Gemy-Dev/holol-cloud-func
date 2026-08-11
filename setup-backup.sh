@@ -3,9 +3,9 @@
 echo "🔧 Setting up Firebase Backup System..."
 
 # Configuration
-PROJECT_ID="medical-advisor-bd734"
+PROJECT_ID="test-medical-80e1b"
 REGION="us-central1"
-BACKUP_BUCKET="${PROJECT_ID}-backups"
+BACKUP_BUCKET="${PROJECT_ID}-firestore-backups"
 
 # Colors for output
 RED='\033[0;31m'

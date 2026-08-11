@@ -5,7 +5,7 @@
 
 echo "🔒 Applying Security Configuration..."
 
-PROJECT_ID="medical-advisor-bd734"
+PROJECT_ID="test-medical-80e1b"
 REGION="us-central1"
 
 # Function to print colored output

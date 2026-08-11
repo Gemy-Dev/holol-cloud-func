@@ -1,7 +1,7 @@
 """Configuration constants and settings."""
 import os
 
-BACKUP_BUCKET = "medical-advisor-bd734-backups"
+BACKUP_BUCKET = "test-medical-80e1b-firestore-backups"
 COLLECTIONS_TO_BACKUP = [
     "users", "products","deals", "clients", "tasks","daily_reports", "plans", "technical_support","main_opportunities",
     "departments", "specialties", "procedures", "companies",

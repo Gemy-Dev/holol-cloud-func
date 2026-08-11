@@ -32,7 +32,7 @@ project/
    ```
 3. Set project:
    ```bash
-   gcloud config set project medical-advisor-bd734
+   gcloud config set project test-medical-80e1b
    ```
 
 ### Deploy
@@ -45,7 +45,7 @@ project/
 
 ### Health Check
 ```bash
-curl https://us-central1-medical-advisor-bd734.cloudfunctions.net/app
+curl https://us-central1-test-medical-80e1b.cloudfunctions.net/app
 ```
 
 ### User Management
