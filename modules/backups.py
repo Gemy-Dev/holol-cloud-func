@@ -14,7 +14,7 @@ import tempfile
 import zipfile
 
 # Iraq timezone (UTC+3)
-IRAQ_TIMEZONE = timezone(timedelta(hours=3))
+from modules.config import IRAQ_TIMEZONE  # noqa: E402  (single source)
 
 def get_iraq_time():
     """Get current time in Iraq timezone (UTC+3)"""

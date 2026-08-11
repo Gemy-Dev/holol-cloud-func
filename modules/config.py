@@ -1,5 +1,12 @@
 """Configuration constants and settings."""
 import os
+from datetime import timedelta, timezone
+
+# The business runs on Iraq time (UTC+3, no DST). Every "which day is
+# this?" decision must be made in this zone: task target dates are
+# written from local midnight, so comparing them in UTC lands them on the
+# previous day.
+IRAQ_TIMEZONE = timezone(timedelta(hours=3))
 
 BACKUP_BUCKET = "test-medical-80e1b-firestore-backups"
 COLLECTIONS_TO_BACKUP = [
