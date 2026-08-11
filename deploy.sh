@@ -156,13 +156,22 @@ setup_schedulers() {
     
     echo "🔗 App Function URL: $FUNCTION_URL"
     
-    # Setup task notifications scheduler (every 10 minutes)
+    # Task notifications: once a day at 05:00 UTC = 08:00 Iraq time, matching
+    # handle_daily_notifications' documented intent. Do NOT shorten this —
+    # the handler has no "already notified" guard, so every run re-pushes to
+    # every user with tasks due that day.
+    #
+    # --headers is load-bearing: without it gcloud sends
+    # Content-Type: application/octet-stream, and main.py's request.get_json()
+    # raises 415, which the generic handler turns into a 500. That silently
+    # broke notifications entirely.
     if gcloud scheduler jobs describe daily-notifications --location=$REGION --project=$PROJECT_ID &>/dev/null; then
         echo "📝 Updating task notifications scheduler..."
         gcloud scheduler jobs update http daily-notifications \
-            --schedule="*/10 * * * *" \
+            --schedule="0 5 * * *" \
             --uri="$FUNCTION_URL" \
             --http-method=POST \
+            --headers="Content-Type=application/json" \
             --message-body='{"action":"daily_notifications"}' \
             --time-zone="UTC" \
             --location=$REGION \
@@ -170,13 +179,14 @@ setup_schedulers() {
     else
         echo "🆕 Creating task notifications scheduler..."
         gcloud scheduler jobs create http daily-notifications \
-            --schedule="*/10 * * * *" \
+            --schedule="0 5 * * *" \
             --uri="$FUNCTION_URL" \
             --http-method=POST \
+            --headers="Content-Type=application/json" \
             --message-body='{"action":"daily_notifications"}' \
             --time-zone="UTC" \
             --location=$REGION \
-            --description="Task notifications every 10 minutes" \
+            --description="Task notifications daily at 08:00 Iraq time" \
             --project=$PROJECT_ID
     fi
     
