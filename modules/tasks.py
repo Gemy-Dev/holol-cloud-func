@@ -2178,6 +2178,150 @@ def get_tasks_by_d00000000ate_range(data, decoded_token, db):
         }), 500
 
 
+def get_tasks_by_date_range(data, decoded_token, db):
+    """Get tasks within a specific date range.
+    
+    Args:
+        data: Request data containing 'date' (YYYY-MM-DD) and 'days' (int)
+        decoded_token: Decoded Firebase Auth token
+        db: Firestore database instance
+        
+    Returns:
+        JSON response with list of tasks
+    """
+    try:
+        uid = decoded_token.get("uid")
+        if not uid:
+            return jsonify({
+                "error": "User ID required",
+                "success": False
+            }), 400
+
+        start_date_str = data.get("date")
+        days = data.get("days")
+        
+        if not start_date_str:
+            return jsonify({
+                "error": "Start date is required",
+                "success": False
+            }), 400
+            
+        if days is None:
+            return jsonify({
+                "error": "Days count is required",
+                "success": False
+            }), 400
+
+        # Parse start date
+        try:
+            # Handle possible ISO format
+            if isinstance(start_date_str, str):
+                if "T" in start_date_str:
+                    start_date = datetime.fromisoformat(start_date_str.replace("Z", "+00:00"))
+                else:
+                    start_date = datetime.strptime(start_date_str, "%Y-%m-%d")
+            elif isinstance(start_date_str, datetime):
+                start_date = start_date_str
+            else:
+                raise ValueError("Invalid date format")
+                
+            # Normalize to start of day
+            start_date = start_date.replace(hour=0, minute=0, second=0, microsecond=0)
+            
+        except Exception:
+            return jsonify({
+                "error": "Invalid date format. Use YYYY-MM-DD",
+                "success": False
+            }), 400
+            
+        try:
+            days_count = int(days)
+        except ValueError:
+            return jsonify({
+                "error": "Days must be an integer",
+                "success": False
+            }), 400
+            
+        # Calculate end date (inclusive)
+        from datetime import timedelta
+        end_date = start_date + timedelta(days=days_count)
+        # Set end date to end of day to be inclusive
+        end_date = end_date.replace(hour=23, minute=59, second=59, microsecond=999999)
+        
+        # Query tasks where user is assigned to
+        # We process targetDate filtering in memory to be safe against index requirements and data inconsistencies
+        
+        matching_tasks = []
+        
+        # Query only by assignedToId, filter by date range in memory to handle null/inconsistent data
+        tasks_query = db.collection("tasks").where("reviewState", "!=", "deleted").stream()
+        for doc in tasks_query:
+            task = doc.to_dict()
+            task["id"] = doc.id
+            target_date_raw = task.get("targetDate")
+
+
+            # Strict check for valid data
+            if target_date_raw is None :
+                continue
+                
+            if isinstance(target_date_raw, str) and not target_date_raw.strip():
+                continue
+                
+            # Parse target date
+            task_date = None
+            try:
+                if isinstance(target_date_raw, datetime):
+                    task_date = target_date_raw
+                elif isinstance(target_date_raw, str):
+                    if "T" in target_date_raw:
+                        task_date = datetime.fromisoformat(target_date_raw.replace("Z", "+00:00"))
+                    else:
+                        task_date = datetime.strptime(target_date_raw[:10], "%Y-%m-%d")
+                elif isinstance(target_date_raw, int):
+                    task_date = datetime.fromtimestamp(target_date_raw / 1000.0)
+            except Exception:
+                continue
+
+            if not task_date:
+                continue
+                
+            # Remove timezone info for comparison if needed
+            if task_date.tzinfo and not start_date.tzinfo:
+                 task_date = task_date.replace(tzinfo=None)
+            
+            # Check if date is within range
+            if start_date <= task_date <= end_date:
+                matching_tasks.append(task)
+        
+        # Sort by target date
+        def get_sort_key(t):
+             d = t.get("targetDate")
+             # Helper to make sort key comparable
+             if isinstance(d, str): return d
+             if isinstance(d, datetime): return d.isoformat()
+             return str(d)
+
+        matching_tasks.sort(key=get_sort_key)
+        
+        return jsonify({
+            "success": True,
+            "data": matching_tasks,
+            "count": len(matching_tasks),
+            "dateRange": {
+                "start": start_date.isoformat(),
+                "end": end_date.isoformat()
+            }
+        })
+        
+    except Exception as e:
+        print(f"Error getting tasks in range: {str(e)}")
+        return jsonify({
+            "error": f"Failed to get tasks: {str(e)}",
+            "success": False
+        }), 500
+
+
 def get_tasks_paginated(data, db):
     """Retrieve tasks with pagination and custom filtering.
     
