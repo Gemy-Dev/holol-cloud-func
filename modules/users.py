@@ -1,5 +1,5 @@
 """User management module for CRUD operations."""
-from firebase_admin import auth
+from firebase_admin import auth, firestore
 import firebase_admin
 from flask import jsonify
 from modules.dates import now_iso
@@ -137,3 +137,145 @@ def delete_user(data, decoded_token, db):
         "uid": uid
     })
 
+
+
+# The notification preference exists under two spellings in production. The
+# dashboard writes the correctly spelled key; the field app has always read the
+# misspelled one. Renaming the *stored* key is deliberately not part of this
+# feature — separating the backfill from a rename means a failure here is
+# attributable to the data rather than to the rename.
+CANONICAL_PREFERENCE_KEY = "receiveEmailNotifications"
+LEGACY_PREFERENCE_KEY = "reciveEmailNotifications"
+
+# Firestore caps a batch at 500 writes.
+_MIGRATION_BATCH_SIZE = 400
+
+
+def migrate_notification_preference(data, decoded_token, db):
+    """Backfill the notification preference onto one canonical key.
+
+    Ordered so that no configured value is lost (data-model.md §1):
+
+    1. canonical present -> keep it; the dashboard is where it is administered
+    2. else legacy present -> copy it across
+    3. else -> write False; a missing preference is not consent
+    4. ``deleteLegacyKey`` -> drop the misspelled key. Only safe once the app
+       release that stops reading it has fully rolled out.
+
+    Steps 1-3 are additive, so the run is reversible until step 4.
+
+    ``valueChanges`` reports any user whose *effective* preference differs
+    before and after. It must come back empty (SC-013); a non-empty list means
+    the precedence logic is wrong, not that a few users need review.
+    """
+    try:
+        requester_uid = decoded_token.get("uid") or decoded_token.get("user_id")
+        if not requester_uid:
+            return jsonify({
+                "success": False,
+                "error": "Unauthorized - no requesting user"
+            }), 403
+
+        requester = db.collection("users").document(requester_uid).get()
+        if not requester.exists:
+            return jsonify({
+                "success": False,
+                "error": "Unauthorized - requesting user not found"
+            }), 403
+
+        # Both flags fail safe. A JSON string such as "false" is truthy in
+        # Python, so a malformed call must land on "do nothing", never on
+        # "rewrite every user document" or "delete the rollback data".
+        dry_run = data.get("dryRun", True) is not False
+        delete_legacy_key = data.get("deleteLegacyKey", False) is True
+
+        scanned = 0
+        canonical_kept = 0
+        backfilled = 0
+        defaulted_false = 0
+        legacy_deleted = 0
+        value_changes = []
+
+        batch = None if dry_run else db.batch()
+        pending = 0
+
+        for user_doc in db.collection("users").stream():
+            scanned += 1
+            doc = user_doc.to_dict() or {}
+            has_canonical = CANONICAL_PREFERENCE_KEY in doc
+            has_legacy = LEGACY_PREFERENCE_KEY in doc
+
+            if has_canonical:
+                resolved = bool(doc[CANONICAL_PREFERENCE_KEY])
+                canonical_kept += 1
+            elif has_legacy:
+                resolved = bool(doc[LEGACY_PREFERENCE_KEY])
+                backfilled += 1
+            else:
+                resolved = False
+                defaulted_false += 1
+
+            # What the user effectively had before this run, under the same
+            # precedence the readers use. Computed independently of `resolved`
+            # so the comparison below is a real check and not a tautology.
+            if has_canonical:
+                effective_before = bool(doc[CANONICAL_PREFERENCE_KEY])
+            elif has_legacy:
+                effective_before = bool(doc[LEGACY_PREFERENCE_KEY])
+            else:
+                effective_before = False
+
+            if effective_before != resolved:
+                value_changes.append({
+                    "userId": user_doc.id,
+                    "before": effective_before,
+                    "after": resolved,
+                })
+
+            update = {}
+            if not has_canonical or doc[CANONICAL_PREFERENCE_KEY] is not resolved:
+                update[CANONICAL_PREFERENCE_KEY] = resolved
+            if delete_legacy_key and has_legacy:
+                update[LEGACY_PREFERENCE_KEY] = firestore.DELETE_FIELD
+                legacy_deleted += 1
+
+            if not update:
+                continue
+
+            if dry_run:
+                continue
+
+            batch.update(db.collection("users").document(user_doc.id), update)
+            pending += 1
+            if pending >= _MIGRATION_BATCH_SIZE:
+                batch.commit()
+                batch = db.batch()
+                pending = 0
+
+        if not dry_run and pending:
+            batch.commit()
+
+        print(
+            f"🔁 Preference migration ({'dry run' if dry_run else 'applied'}): "
+            f"scanned={scanned} kept={canonical_kept} backfilled={backfilled} "
+            f"defaulted={defaulted_false} legacyDeleted={legacy_deleted}"
+        )
+        if value_changes:
+            print(f"❌ {len(value_changes)} preference value(s) would change — "
+                  f"this is a failed migration, not a warning")
+
+        return jsonify({
+            "success": True,
+            "dryRun": dry_run,
+            "scanned": scanned,
+            "canonicalKept": canonical_kept,
+            "backfilledFromLegacy": backfilled,
+            "defaultedFalse": defaulted_false,
+            "legacyKeysDeleted": legacy_deleted,
+            "valueChanges": value_changes,
+        }), 200
+
+    except Exception as e:
+        error_msg = f"Error migrating notification preference: {str(e)}"
+        print(f"❌ {error_msg}")
+        return jsonify({"success": False, "error": error_msg}), 500

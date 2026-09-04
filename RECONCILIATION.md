@@ -1,6 +1,10 @@
 # Deployment reconciliation — port-in list
 
-**Status: nothing deployed, nothing backfilled. This is the list only.**
+**Status: port-in DONE. Nothing deployed, nothing backfilled.**
+
+Steps 1–5 below are complete as of 2026-09-04. The suite went 79 → 131, and
+no symbol that is live in production is missing from the checkout any more.
+What remains is the deploy gate at the bottom, which is a human decision.
 
 The deployed `app` function is not built from any committed state of this
 repository. Code was deployed from a working tree and never committed, so
@@ -182,12 +186,12 @@ ahead. No function is live-only in this module.
 
 ## Gate before deploying
 
-- [ ] Steps 1–5 done, suite green (~131 tests)
-- [ ] `grep -rn SERVER_TIMESTAMP modules/` returns nothing outside `dates.py`'s
-      docstring — the port-in re-adds `firestore` to `users.py` and it must not
-      bring the sentinel back with it
-- [ ] Diff the reconciled checkout against the deployed zip again; the only
-      differences should be the intended new work
+- [x] Steps 1–5 done, suite green — **131 tests passing**
+- [x] `grep -rn SERVER_TIMESTAMP modules/` returns only `dates.py`'s docstring.
+      `firestore` is back in `users.py` for `DELETE_FIELD`, without the sentinel.
+- [x] Re-diffed against the deployed zip. Every remaining live-only line is
+      either a `SERVER_TIMESTAMP` write that R1 deliberately removes, or the
+      old `regenerate_plan_tasks` body the working tree replaces.
 - [ ] Commit. **The reason this list exists is that the last deploy was not
       committed** — a deploy from an uncommitted tree makes the next person do
       this again.

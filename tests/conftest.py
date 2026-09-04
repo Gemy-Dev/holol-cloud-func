@@ -1,6 +1,7 @@
 """Shared test fixtures and helpers for reconcile_client_tasks tests."""
 from __future__ import annotations
 
+import re
 import sys
 import os
 from datetime import datetime, timezone
@@ -8,7 +9,10 @@ from typing import Optional
 from unittest.mock import MagicMock, patch
 import pytest
 from flask import Flask
-import re
+
+# Make the project root importable
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+
 
 # Contract rule R1 (docs/firestore-contract.md in either Flutter repo): every
 # stored date is a zone-less ISO-8601 string with millisecond precision, the
@@ -22,8 +26,15 @@ def is_contract_iso(value):
     """Whether a written date matches what the Flutter clients write."""
     return isinstance(value, str) and bool(_CONTRACT_ISO.match(value))
 
-# Make the project root importable
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+# The real field-deletion sentinel, so _FakeDocRef.update can remove a key the
+# way Firestore does. Falls back to a private sentinel if firebase_admin is not
+# installed, which keeps the pure-logic tests runnable without it.
+try:
+    from firebase_admin import firestore as _firestore
+
+    DELETE_FIELD = _firestore.DELETE_FIELD
+except Exception:  # pragma: no cover - only hit without firebase_admin
+    DELETE_FIELD = object()
 
 
 # ---------------------------------------------------------------------------
@@ -47,7 +58,14 @@ class _FakeDocRef:
 
     def update(self, data: dict):
         existing = self._store.setdefault(self._collection, {}).get(self._doc_id, {})
-        existing.update(data)
+        for key, value in data.items():
+            # Honour the real DELETE_FIELD sentinel. A plain dict update would
+            # store the sentinel as the value, so a test for "key removed"
+            # would pass against code that never removes anything.
+            if value is DELETE_FIELD:
+                existing.pop(key, None)
+            else:
+                existing[key] = value
         self._store[self._collection][self._doc_id] = existing
 
     def get(self):

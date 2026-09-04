@@ -234,18 +234,44 @@ def handle_daily_notifications(db, days_offset=0):
 
 
 def handle_send_notification(decoded_token, data, db):
-    """Send a notification to a specific user by FCM token."""
+    """Send a notification to one user, addressed by id or by raw token.
+
+    ``targetUserId`` is the path callers should use: the field app has no read
+    access to another user's document, so requiring an ``fcmToken`` up front
+    meant it could never address anyone but itself and fell back to
+    broadcasting instead. ``fcmToken`` stays accepted for existing callers.
+    """
     try:
+        target_user_id = data.get("targetUserId")
         fcm_token = data.get("fcmToken")
         title = data.get("title")
         body = data.get("body")
         notification_action = data.get("notificationAction")
 
-        if not fcm_token:
-            return jsonify({"success": False, "error": "fcmToken is required"}), 400
+        if not target_user_id and not fcm_token:
+            return jsonify({
+                "success": False,
+                "error": "targetUserId or fcmToken is required"
+            }), 400
 
         if not title or not body:
             return jsonify({"success": False, "error": "title and body are required"}), 400
+
+        # Resolve server-side when addressed by id. A token read now also beats
+        # one the caller cached earlier, so the id wins if both are supplied.
+        if target_user_id:
+            snapshot = db.collection("users").document(target_user_id).get()
+            fcm_token = (snapshot.to_dict() or {}).get("fcmToken") if snapshot.exists else None
+
+        if not fcm_token:
+            # Not an error: the user simply has no device registered. Reporting
+            # this as a failure would make an ordinary state look like an
+            # outage every time someone had not installed the app yet.
+            print(f"📭 No valid registration for user {target_user_id}")
+            return jsonify({
+                "success": False,
+                "reason": "no_valid_registration"
+            }), 200
 
         # Prepare message data
         message_data = {}
@@ -279,10 +305,19 @@ def handle_send_notification(decoded_token, data, db):
         }), 200
 
     except messaging.UnregisteredError:
+        # 200, not 400: the request was well-formed and the outcome is known
+        # and final. Clear the registration so it is not retried forever —
+        # only possible when addressed by id, since a raw token carries no
+        # owner and finding one would need a query with no index behind it.
+        if target_user_id:
+            _prune_token(db, target_user_id, fcm_token)
+        else:
+            print("⚠️ Unregistered token supplied directly — no owner to clear")
+
         return jsonify({
             "success": False,
-            "error": "FCM token is invalid or unregistered"
-        }), 400
+            "reason": "token_pruned"
+        }), 200
 
     except Exception as e:
         error_msg = f"Error sending notification: {str(e)}"
@@ -293,6 +328,49 @@ def handle_send_notification(decoded_token, data, db):
             "success": False,
             "error": error_msg
         }), 500
+
+
+def _is_permanently_invalid_token(exception):
+    """Whether ``exception`` means this registration will never work again.
+
+    Only permanent rejections qualify. A transient send failure is not evidence
+    that the device is gone, and clearing a live token would end delivery for a
+    user who was reachable all along.
+    """
+    if exception is None:
+        return False
+
+    permanent = []
+    for name in ("UnregisteredError", "SenderIdMismatchError"):
+        candidate = getattr(messaging, name, None)
+        # Guarded because a stubbed messaging module hands back non-classes,
+        # and isinstance() against one of those raises.
+        if isinstance(candidate, type) and issubclass(candidate, BaseException):
+            permanent.append(candidate)
+
+    return bool(permanent) and isinstance(exception, tuple(permanent))
+
+
+def _prune_token(db, user_id, token):
+    """Clear ``token`` from ``user_id``. Returns 1 if it was cleared, else 0.
+
+    Re-reads the document first so a token the user has already replaced — a
+    rotation that landed while this send was in flight — is left alone.
+    """
+    try:
+        doc_ref = db.collection("users").document(user_id)
+        snapshot = doc_ref.get()
+        if not snapshot.exists:
+            return 0
+        if (snapshot.to_dict() or {}).get("fcmToken") != token:
+            return 0
+        doc_ref.update({"fcmToken": None})
+        print(f"🧹 Cleared dead registration for user {user_id}")
+        return 1
+    except Exception as prune_error:
+        # Pruning is housekeeping — never fail a delivered send over it.
+        print(f"⚠️ Could not clear registration for user {user_id}: {prune_error}")
+        return 0
 
 
 def handle_send_notification_to_all(decoded_token, data, db):
@@ -324,25 +402,56 @@ def handle_send_notification_to_all(decoded_token, data, db):
             else:
                 message_data["action"] = str(notification_action)
         
-        # Get all users with FCM tokens, excluding the sender
-        users_ref = db.collection("users").stream()
+        # The audience, per data-model.md §2. The preference and the active
+        # flag are a composite Firestore query; excluding the sender and
+        # tokenless users is done here because Firestore cannot express
+        # "document id !=" alongside the other filters without a further index,
+        # and an empty-string check is cheaper in code than as an index term.
+        #
+        # This used to stream the entire users collection: a read per user on
+        # every business event, and — worse — no preference check at all, so
+        # someone who had switched notifications off still received every one.
+        #
+        # Requires the composite index on users (receiveEmailNotifications ASC,
+        # isActive ASC).
+        audience = (
+            db.collection("users")
+            .where("receiveEmailNotifications", "==", True)
+            .where("isActive", "==", True)
+        )
+
+        # The owning user id is kept alongside each token so a registration FCM
+        # rejects can be traced back to the document holding it.
         tokens = []
-        
-        for user_doc in users_ref:
+        token_owners = []
+
+        for user_doc in audience.stream():
             # Skip the sender — they don't need their own notification
             if sender_id and user_doc.id == sender_id:
                 continue
-            user = user_doc.to_dict()
-            fcm_token = user.get("fcmToken")
-            if fcm_token:
-                tokens.append(fcm_token)
-        
+            fcm_token = (user_doc.to_dict() or {}).get("fcmToken")
+            # Opted in but unregistered is not a delivery failure — they simply
+            # have no device. SC-009 measures success against registered
+            # devices, not against everyone opted in.
+            if not fcm_token:
+                continue
+            tokens.append(fcm_token)
+            token_owners.append(user_doc.id)
+
         if not tokens:
+            # A valid outcome, not an error. FR-023 keeps the record saved
+            # regardless, and the previous 404 read to the caller as a failure
+            # to save the record that triggered the notification.
+            print("📭 No eligible recipients — nothing to send")
             return jsonify({
-                "success": False,
-                "error": "No users with FCM tokens found"
-            }), 404
-        
+                "success": True,
+                "message": "Notification sent to 0 users",
+                "successCount": 0,
+                "failureCount": 0,
+                "totalTokens": 0,
+                "prunedTokens": 0
+            }), 200
+
         print(f"📢 Sending notification to {len(tokens)} users (excluded sender: {sender_id})")
         
         # Build multicast message
@@ -361,19 +470,29 @@ def handle_send_notification_to_all(decoded_token, data, db):
             failure_count = response.failure_count
             
             print(f"✅ Sent to {success_count} users, {failure_count} failed")
-            
-            # Log failures if any
+
+            # Clear registrations FCM says are gone for good. Left in place they
+            # are retried on every send forever, dragging the delivery rate down
+            # and hiding the fact that a real user has stopped receiving.
+            pruned = 0
             if failure_count > 0:
                 for idx, resp in enumerate(response.responses):
-                    if not resp.success:
-                        print(f"❌ Failed to send to token {idx}: {resp.exception}")
-            
+                    if resp.success:
+                        continue
+                    print(f"❌ Failed to send to token {idx}: {resp.exception}")
+                    if _is_permanently_invalid_token(resp.exception):
+                        pruned += _prune_token(db, token_owners[idx], tokens[idx])
+
+            if pruned:
+                print(f"🧹 Cleared {pruned} dead device registration(s)")
+
             return jsonify({
                 "success": True,
                 "message": f"Notification sent to {success_count} users",
                 "successCount": success_count,
                 "failureCount": failure_count,
-                "totalTokens": len(tokens)
+                "totalTokens": len(tokens),
+                "prunedTokens": pruned
             })
         except Exception as send_error:
             error_msg = str(send_error)
