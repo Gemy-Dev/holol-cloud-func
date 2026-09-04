@@ -1,7 +1,8 @@
 """User management module for CRUD operations."""
-from firebase_admin import auth, firestore
+from firebase_admin import auth
 import firebase_admin
 from flask import jsonify
+from modules.dates import now_iso
 
 
 def create_user(data, decoded_token, db):
@@ -36,7 +37,7 @@ def create_user(data, decoded_token, db):
             "department": data.get("department"),
             "permissions": data.get("permissions", []),
             "profileImageUrl": data.get("profileImageUrl"),
-            "createdAt": firestore.SERVER_TIMESTAMP,  # type: ignore[attr-defined]
+            "createdAt": now_iso(),
             "updatedAt": None,
             "isActive": data.get("isActive", True),
             "lastLogin": None,
@@ -82,7 +83,7 @@ def update_user(data, decoded_token, db):
         "phoneNumber": data.get("phoneNumber"),
         "permissions": data.get("permissions", []),
         "profileImageUrl": data.get("profileImageUrl"),
-        "updatedAt": firestore.SERVER_TIMESTAMP,  # type: ignore[attr-defined]
+        "updatedAt": now_iso(),
         "isActive": data.get("isActive", True),
         "lastLogin": data.get("lastLogin"),
         "plans": data.get("plans", []),

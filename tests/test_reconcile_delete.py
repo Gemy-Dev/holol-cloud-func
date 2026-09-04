@@ -12,6 +12,7 @@ from tests.conftest import (
     seed_db,
 )
 from modules.tasks import reconcile_client_tasks
+from tests.conftest import is_contract_iso
 
 
 def _call(db, client_data):
@@ -46,7 +47,9 @@ class TestR4RemovedDoctorSoftDeleted:
 
         updated = db.collection("tasks").document("t1").get().to_dict()
         assert updated["reviewState"] == "deleted"
-        assert updated["updatedAt"] == "SERVER_TIMESTAMP"
+        # Contract rule R1: an ISO-8601 string, never a Timestamp — the
+        # field app and the dashboard order this collection on it.
+        assert is_contract_iso(updated["updatedAt"])
 
     def test_removed_doctor_completed_task_retained(self, db):
         """R1 + R4: completed task for a removed doctor is kept."""

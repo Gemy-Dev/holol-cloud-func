@@ -12,6 +12,7 @@ from tests.conftest import (
     seed_db,
 )
 from modules.tasks import reconcile_client_tasks
+from tests.conftest import is_contract_iso
 
 
 def _call(db, client_data):
@@ -48,7 +49,9 @@ class TestR2PriorityDrift:
 
         updated = db.collection("tasks").document("t1").get().to_dict()
         assert updated["priority"] == "A"
-        assert updated["updatedAt"] == "SERVER_TIMESTAMP"
+        # Contract rule R1: an ISO-8601 string, never a Timestamp — the
+        # field app and the dashboard order this collection on it.
+        assert is_contract_iso(updated["updatedAt"])
 
     def test_multiple_tasks_for_same_doctor_all_updated(self, db):
         doctor = make_influencer_doctor("Dr. X", priority="B")

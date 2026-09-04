@@ -8,6 +8,19 @@ from typing import Optional
 from unittest.mock import MagicMock, patch
 import pytest
 from flask import Flask
+import re
+
+# Contract rule R1 (docs/firestore-contract.md in either Flutter repo): every
+# stored date is a zone-less ISO-8601 string with millisecond precision, the
+# exact shape Dart's DateTime.toIso8601String() produces for a local value. An
+# offset suffix would parse fine on both clients but sort differently, and
+# lexicographic order is the point of the rule.
+_CONTRACT_ISO = re.compile(r'^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}$')
+
+
+def is_contract_iso(value):
+    """Whether a written date matches what the Flutter clients write."""
+    return isinstance(value, str) and bool(_CONTRACT_ISO.match(value))
 
 # Make the project root importable
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
@@ -245,8 +258,8 @@ def make_task(
         'productId': product_id,
         'marketingTask': marketing_task,
         'taskType': 'planned',
-        'createdAt': 'SERVER_TIMESTAMP',
-        'updatedAt': 'SERVER_TIMESTAMP',
+        'createdAt': '2026-01-01T00:00:00.000',
+        'updatedAt': '2026-01-01T00:00:00.000',
     }
 
 
