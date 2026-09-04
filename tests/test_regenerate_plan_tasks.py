@@ -1,4 +1,4 @@
-"""Tests for regenerate_plan_tasks: wipe + recreate a plan's tasks after an edit."""
+"""Tests for regenerate_plan_tasks: diff-based sync of a plan's tasks after an edit."""
 from unittest.mock import patch
 
 from tests.conftest import (
@@ -68,19 +68,45 @@ class TestRemovedProduct:
 
         assert status == 200
         assert body['success'] is True
-        assert body['tasksDeleted'] == 2
-        assert body['tasksCreated'] == 1
+        # Only the removed product's task is deleted; the still-wanted one is kept
+        assert body['tasksDeleted'] == 1
+        assert body['tasksCreated'] == 0
+        assert body['tasksKept'] == 1
         assert body['tasksProtected'] == 0
 
         remaining = _tasks(db)
-        assert len(remaining) == 1
-        # Full wipe + recreate: the surviving task is a brand new document
-        assert 't1' not in remaining and 't2' not in remaining
-        only_task = next(iter(remaining.values()))
-        assert only_task['productId'] == 'prod1'
-        assert only_task['status'] == 'pending'
-        assert only_task['doctorName'] == 'Dr. X'
-        assert only_task['priority'] == 'A'
+        # The surviving task is the original document, not a recreation
+        assert list(remaining) == ['t1']
+        assert remaining['t1']['productId'] == 'prod1'
+        assert remaining['t1']['status'] == 'pending'
+
+    def test_completed_task_for_removed_product_survives(self, db: FakeFirestore):
+        _seed_single_client_plan(db, products=('prod1', 'prod2'), tasks=[
+            make_task('t1', product_id='prod1'),
+            make_task('t2', product_id='prod2', status='completed'),
+            make_task('t3', product_id='prod2'),
+        ])
+
+        body, _ = _call(db, _plan_with_products('prod1'))
+
+        assert body['tasksProtected'] == 1
+        assert body['tasksKept'] == 1
+        assert body['tasksDeleted'] == 1
+        assert body['tasksCreated'] == 0
+
+        remaining = _tasks(db)
+        assert set(remaining) == {'t1', 't2'}
+        assert remaining['t2']['status'] == 'completed'
+
+    def test_canceled_task_for_removed_product_is_deleted(self, db: FakeFirestore):
+        _seed_single_client_plan(db, tasks=[
+            make_task('t1', product_id='prod2', status='canceled'),
+        ])
+
+        body, _ = _call(db, _plan_with_products('prod1'))
+
+        assert body['tasksDeleted'] == 1
+        assert 't1' not in _tasks(db)
 
 
 class TestProtectedTasks:
@@ -126,7 +152,7 @@ class TestProtectedTasks:
         assert body['tasksCreated'] == 0
         assert list(_tasks(db)) == ['t1']
 
-    def test_canceled_task_without_visit_result_is_deleted(self, db: FakeFirestore):
+    def test_canceled_task_for_still_wanted_combo_is_kept(self, db: FakeFirestore):
         _seed_single_client_plan(db, tasks=[
             make_task('t1', product_id='prod1', status='canceled'),
         ])
@@ -134,12 +160,13 @@ class TestProtectedTasks:
         body, _ = _call(db, _plan_with_products('prod1'))
 
         assert body['tasksProtected'] == 0
-        assert body['tasksDeleted'] == 1
-        assert body['tasksCreated'] == 1
+        assert body['tasksDeleted'] == 0
+        assert body['tasksCreated'] == 0
+        assert body['tasksKept'] == 1
 
         remaining = _tasks(db)
-        assert 't1' not in remaining
-        assert next(iter(remaining.values()))['status'] == 'pending'
+        assert list(remaining) == ['t1']
+        assert remaining['t1']['status'] == 'canceled'
 
     def test_other_plans_tasks_are_untouched(self, db: FakeFirestore):
         _seed_single_client_plan(db, tasks=[
@@ -149,14 +176,33 @@ class TestProtectedTasks:
 
         body, _ = _call(db, _plan_with_products('prod1'))
 
-        assert body['tasksDeleted'] == 1
-        assert 'other' in _tasks(db)
+        assert body['tasksDeleted'] == 0
+        assert body['tasksKept'] == 1
+        assert set(_tasks(db)) == {'t1', 'other'}
 
 
-class TestNewTargeting:
-    """Newly matching clients get their tasks on the same pass."""
+class TestAdditiveEdits:
+    """Adding a product or a city deletes nothing — only the missing tasks are created."""
 
-    def test_added_city_creates_tasks_for_its_clients(self, db: FakeFirestore):
+    def test_added_product_creates_only_its_own_tasks(self, db: FakeFirestore):
+        task = make_task('t1', product_id='prod1')
+        task['targetDate'] = '2026-09-01T10:00:00.000Z'  # scheduled by the planner
+        _seed_single_client_plan(db, tasks=[task])
+
+        body, _ = _call(db, _plan_with_products('prod1', 'prod2'))
+
+        assert body['tasksDeleted'] == 0
+        assert body['tasksKept'] == 1
+        assert body['tasksCreated'] == 1
+
+        remaining = _tasks(db)
+        assert 't1' in remaining
+        # The kept task is untouched, including its scheduler assignment
+        assert remaining['t1']['targetDate'] == '2026-09-01T10:00:00.000Z'
+        product_ids = {t['productId'] for t in remaining.values()}
+        assert product_ids == {'prod1', 'prod2'}
+
+    def test_added_client_via_city_keeps_existing_tasks(self, db: FakeFirestore):
         seed_db(
             db,
             clients=[
@@ -172,12 +218,28 @@ class TestNewTargeting:
 
         body, _ = _call(db, _plan_with_products('prod1', cities=['الرياض', 'جدة']))
 
-        assert body['tasksDeleted'] == 1
-        assert body['tasksCreated'] == 2
+        assert body['tasksDeleted'] == 0
+        assert body['tasksKept'] == 1
+        assert body['tasksCreated'] == 1
 
-        client_ids = {t['clientId'] for t in _tasks(db).values()}
+        tasks = _tasks(db)
+        assert 't1' in tasks
+        client_ids = {t['clientId'] for t in tasks.values()}
         assert client_ids == {'client1', 'client2'}
         assert set(body['clientsIds']) == {'client1', 'client2'}
+
+    def test_duplicate_pending_task_is_removed(self, db: FakeFirestore):
+        _seed_single_client_plan(db, tasks=[
+            make_task('t1', product_id='prod1'),
+            make_task('t2', product_id='prod1'),  # duplicate combination
+        ])
+
+        body, _ = _call(db, _plan_with_products('prod1'))
+
+        assert body['tasksKept'] == 1
+        assert body['tasksDeleted'] == 1
+        assert body['tasksCreated'] == 0
+        assert len(_tasks(db)) == 1
 
 
 class TestPlanCounters:

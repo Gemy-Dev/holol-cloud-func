@@ -161,17 +161,21 @@ setup_schedulers() {
     # the handler has no "already notified" guard, so every run re-pushes to
     # every user with tasks due that day.
     #
-    # --headers is load-bearing: without it gcloud sends
+    # The Content-Type header is load-bearing: without it gcloud sends
     # Content-Type: application/octet-stream, and main.py's request.get_json()
     # raises 415, which the generic handler turns into a 500. That silently
     # broke notifications entirely.
+    #
+    # `create` spells it --headers and `update` spells it --update-headers.
+    # Getting that wrong fails only the update branch, so it stays invisible
+    # until the day a redeploy has to move the jobs to a new function URL.
     if gcloud scheduler jobs describe daily-notifications --location=$REGION --project=$PROJECT_ID &>/dev/null; then
         echo "📝 Updating task notifications scheduler..."
         gcloud scheduler jobs update http daily-notifications \
             --schedule="0 5 * * *" \
             --uri="$FUNCTION_URL" \
             --http-method=POST \
-            --headers="Content-Type=application/json" \
+            --update-headers="Content-Type=application/json" \
             --message-body='{"action":"daily_notifications"}' \
             --time-zone="UTC" \
             --location=$REGION \
@@ -199,7 +203,7 @@ setup_schedulers() {
             --schedule="0 17 * * *" \
             --uri="$FUNCTION_URL" \
             --http-method=POST \
-            --headers="Content-Type=application/json" \
+            --update-headers="Content-Type=application/json" \
             --message-body='{"action":"notify_tomorrow_tasks"}' \
             --time-zone="UTC" \
             --location=$REGION \

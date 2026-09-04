@@ -4,6 +4,16 @@ from firebase_admin import firestore
 import traceback
 from datetime import datetime, timezone
 from modules.config import IRAQ_TIMEZONE
+from modules.dates import now_iso
+
+# Page size used when the caller does not ask for a specific one.
+DEFAULT_PAGE_SIZE = 20
+
+# Hard ceiling on how many tasks one response may carry. It bounds both the
+# response size and the memory a single request holds, and it is what makes the
+# "give me the whole plan" mode (pageSize <= 0) safe on an unexpectedly large
+# plan: the response is truncated and the caller pages through the rest.
+MAX_TASKS_PER_RESPONSE = 2000
 
 # ---------------------------------------------------------------------------
 # Reconcile helpers
@@ -108,8 +118,8 @@ def _build_planned_task_payload(plan_id, client_id, product_id, marketing_task_n
         "priority": _doctor_priority_name(doctor),
         "note": None,  # Optional
         "doctorName": doctor.get("name", ""),  # Doctor name from influencer doctor
-        "createdAt": firestore.SERVER_TIMESTAMP,  # type: ignore[attr-defined]
-        "updatedAt": firestore.SERVER_TIMESTAMP,  # type: ignore[attr-defined]
+        "createdAt": now_iso(),
+        "updatedAt": now_iso(),
         "marketingTask": marketing_task_name,  # Stored as string to match duplicate check query
     }
 
@@ -649,7 +659,7 @@ def create_plan_tasks(data, db):
             plan_ref = db.collection("plans").document(plan_id)
             plan_ref.update({
                 "clientsIds": client_ids,
-                "updatedAt": firestore.SERVER_TIMESTAMP  # type: ignore[attr-defined]
+                "updatedAt": now_iso()
             })
         except Exception as update_error:
             # Log error but don't fail the task creation
@@ -748,18 +758,22 @@ def create_plan_tasks(data, db):
 
 
 def regenerate_plan_tasks(data, db):
-    """Wipe and recreate a plan's tasks after the plan was edited.
+    """Sync a plan's tasks with its edited targeting data.
 
-    Called when a planner edits a plan's targeting data (cities, departments or
-    target products). Tasks generated from the previous data would otherwise
-    live on forever, so the whole task set is rebuilt from the new plan:
+    Called when a planner edits a plan (cities, departments or target
+    products). The plan's existing tasks are diffed against the combinations
+    the new plan data implies, instead of being wiped wholesale:
 
       - Tasks holding real fieldwork are protected and left untouched:
         completed tasks, and any task carrying a visitResult.
-      - Every other task of the plan is hard-deleted.
-      - The full task set is then regenerated from the plan's current cities /
-        departments / products, skipping combinations already covered by a
-        protected task so nothing is duplicated.
+      - Pending tasks whose combination still matches the plan are kept
+        as-is, so scheduler assignments (targetDate) survive the edit.
+        Adding a product or a city therefore deletes nothing — it only
+        creates the missing tasks, exactly like plan creation does.
+      - Pending tasks whose combination no longer matches (a removed
+        product, city or department) are hard-deleted.
+      - Combinations not covered by any existing task are created with the
+        same payload used at plan creation.
 
     Deletes and creates are collected first and committed together in batches of
     at most 499 writes, so a mid-way failure cannot leave the plan emptied.
@@ -769,7 +783,7 @@ def regenerate_plan_tasks(data, db):
         db:   Firestore database instance.
 
     Returns:
-        JSON response with the delete/create counts.
+        JSON response with the delete/keep/create counts.
     """
     plan, error = _validate_plan_payload(data)
     if error:
@@ -781,41 +795,16 @@ def regenerate_plan_tasks(data, db):
     plan_departments = plan["departments"]
 
     try:
-        # --- Phase 1: partition the plan's existing tasks ---
-        protected_keys = set()
-        protected_client_ids = set()
-        protected_count = 0
-        doomed_refs = []
-
-        for task_doc in db.collection("tasks").where("planId", "==", plan_id).stream():
-            task = task_doc.to_dict()
-            if _task_is_protected(task):
-                protected_count += 1
-                protected_keys.add(
-                    _task_identity_key(
-                        plan_id,
-                        task.get("clientId"),
-                        task.get("productId"),
-                        task.get("marketingTask"),
-                        task.get("doctorName"),
-                    )
-                )
-                client_id = task.get("clientId")
-                if client_id:
-                    protected_client_ids.add(client_id)
-            else:
-                doomed_refs.append(db.collection("tasks").document(task_doc.id))
-
-        # --- Phase 2: rebuild the desired task set from the plan's new data ---
-        # Both raise a detailed exception when nothing matches.
+        # --- Phase 1: build the desired task set from the plan's new data ---
+        # Both fetches raise a detailed exception when nothing matches, and
+        # both run before anything is deleted.
         products = _fetch_target_products_simple(product_ids, db)
         clients = _fetch_eligible_clients(plan_departments, plan_cities, db)
 
         client_ids = [client["id"] for client in clients]
 
-        batch_ops = [("delete", ref, None) for ref in doomed_refs]
-        created_count = 0
-        skipped_count = 0
+        # identity key -> (client, product, marketing_task_name, doctor)
+        desired = {}
         clients_without_doctors = 0
         total_influencer_doctors = 0
 
@@ -853,24 +842,60 @@ def regenerate_plan_tasks(data, db):
                             marketing_task_name,
                             doctor.get("name", ""),
                         )
-                        # A protected task already covers this combination.
-                        if key in protected_keys:
-                            skipped_count += 1
-                            continue
+                        desired[key] = (client, product, marketing_task_name, doctor)
 
-                        task_data = _build_planned_task_payload(
-                            plan_id,
-                            client["id"],
-                            product["id"],
-                            marketing_task_name,
-                            doctor,
-                        )
-                        batch_ops.append(
-                            ("set", db.collection("tasks").document(), task_data)
-                        )
-                        created_count += 1
+        # --- Phase 2: partition the plan's existing tasks against the desired set ---
+        covered_keys = set()
+        protected_client_ids = set()
+        protected_count = 0
+        kept_count = 0
+        doomed_refs = []
 
-        # --- Phase 3: commit deletes and creates together (chunked at <= 499) ---
+        for task_doc in db.collection("tasks").where("planId", "==", plan_id).stream():
+            task = task_doc.to_dict()
+            key = _task_identity_key(
+                plan_id,
+                task.get("clientId"),
+                task.get("productId"),
+                task.get("marketingTask"),
+                task.get("doctorName"),
+            )
+            if _task_is_protected(task):
+                protected_count += 1
+                covered_keys.add(key)
+                client_id = task.get("clientId")
+                if client_id:
+                    protected_client_ids.add(client_id)
+            elif key in desired and key not in covered_keys:
+                # Still wanted by the edited plan: keep the task (and its
+                # scheduling) untouched.
+                kept_count += 1
+                covered_keys.add(key)
+            else:
+                # The combination was removed from the plan, or the task is a
+                # duplicate of one already kept.
+                doomed_refs.append(db.collection("tasks").document(task_doc.id))
+
+        # --- Phase 3: create only the combinations nothing covers yet ---
+        batch_ops = [("delete", ref, None) for ref in doomed_refs]
+        created_count = 0
+
+        for key, (client, product, marketing_task_name, doctor) in desired.items():
+            if key in covered_keys:
+                continue
+            task_data = _build_planned_task_payload(
+                plan_id,
+                client["id"],
+                product["id"],
+                marketing_task_name,
+                doctor,
+            )
+            batch_ops.append(
+                ("set", db.collection("tasks").document(), task_data)
+            )
+            created_count += 1
+
+        # --- Phase 4: commit deletes and creates together (chunked at <= 499) ---
         BATCH_LIMIT = 499
         for i in range(0, len(batch_ops), BATCH_LIMIT):
             chunk = batch_ops[i:i + BATCH_LIMIT]
@@ -882,7 +907,7 @@ def regenerate_plan_tasks(data, db):
                     batch.set(ref, op_data)
             batch.commit()
 
-        # --- Phase 4: refresh the plan's denormalised counters ---
+        # --- Phase 5: refresh the plan's denormalised counters ---
         # Clients of protected tasks stay in clientsIds even when they no longer
         # match the plan's targeting: the dashboards use clientsIds as the
         # denominator for completed-client KPIs, so dropping them would skew it.
@@ -890,13 +915,14 @@ def regenerate_plan_tasks(data, db):
         merged_client_ids = client_ids + [
             cid for cid in sorted(protected_client_ids) if cid not in matched_client_ids
         ]
-        tasks_count = protected_count + created_count
+        skipped_count = len(desired) - created_count
+        tasks_count = protected_count + kept_count + created_count
         try:
             plan_ref = db.collection("plans").document(plan_id)
             plan_ref.update({
                 "clientsIds": merged_client_ids,
                 "tasksCount": tasks_count,
-                "updatedAt": firestore.SERVER_TIMESTAMP,  # type: ignore[attr-defined]
+                "updatedAt": now_iso(),
             })
         except Exception as update_error:
             # Log but don't fail: the tasks themselves are already correct.
@@ -905,12 +931,14 @@ def regenerate_plan_tasks(data, db):
         return jsonify({
             "success": True,
             "message": (
-                f"Regenerated plan tasks: {len(doomed_refs)} deleted, "
-                f"{created_count} created, {protected_count} protected"
+                f"Synced plan tasks: {len(doomed_refs)} deleted, "
+                f"{created_count} created, {kept_count} kept, "
+                f"{protected_count} protected"
             ),
             "planId": plan_id,
             "tasksDeleted": len(doomed_refs),
             "tasksProtected": protected_count,
+            "tasksKept": kept_count,
             "tasksCreated": created_count,
             "tasksSkipped": skipped_count,
             "tasksCount": tasks_count,
@@ -1026,7 +1054,7 @@ def reconcile_client_tasks(data, db):
                     batch_ops.append(
                         ("update", task_ref, {
                             "priority": new_priority,
-                            "updatedAt": firestore.SERVER_TIMESTAMP,  # type: ignore[attr-defined]
+                            "updatedAt": now_iso(),
                         })
                     )
                     tasks_updated += 1
@@ -1036,7 +1064,7 @@ def reconcile_client_tasks(data, db):
                 batch_ops.append(
                     ("update", task_ref, {
                         "reviewState": "deleted",
-                        "updatedAt": firestore.SERVER_TIMESTAMP,  # type: ignore[attr-defined]
+                        "updatedAt": now_iso(),
                     })
                 )
                 tasks_deleted += 1
@@ -1153,8 +1181,8 @@ def reconcile_client_tasks(data, db):
                             "priority": doctor.get("priority", "C"),
                             "note": None,
                             "doctorName": doctor.get("name", ""),
-                            "createdAt": firestore.SERVER_TIMESTAMP,  # type: ignore[attr-defined]
-                            "updatedAt": firestore.SERVER_TIMESTAMP,  # type: ignore[attr-defined]
+                            "createdAt": now_iso(),
+                            "updatedAt": now_iso(),
                             "marketingTask": marketing_task_name,
                         }
                         new_ref = db.collection("tasks").document()
@@ -2186,11 +2214,34 @@ def get_tasks_by_date_range(data, decoded_token, db):
 
 
 
+def _resolve_page_size(raw_page_size):
+    """Return how many tasks one response may carry.
+
+    `raw_page_size <= 0` means "the whole plan in one response" and resolves to
+    the cap. Anything above the cap is clamped to it, and a non-numeric value
+    falls back to the default.
+    """
+    try:
+        page_size = int(raw_page_size)
+    except (TypeError, ValueError):
+        return DEFAULT_PAGE_SIZE
+    if page_size <= 0:
+        return MAX_TASKS_PER_RESPONSE
+    return min(page_size, MAX_TASKS_PER_RESPONSE)
+
+
 def get_tasks_paginated(data, db):
     """Retrieve tasks with pagination and custom filtering.
-    
+
     To avoid complex index requirements, we fetch tasks by planId,
     and then filter, sort, and paginate them in memory.
+
+    Because every call already scans the plan's whole task set, a caller that
+    filters client-side (the app's advanced filter panel) would pay one full
+    scan per page while only ever seeing 20 tasks at a time. Such callers send
+    `pageSize <= 0` to get the plan's tasks in a single response instead; the
+    result is still capped at MAX_TASKS_PER_RESPONSE, and a plan bigger than the
+    cap keeps paginating through the usual `lastDocument` cursor.
     """
     try:
         plan_id = data.get("planId")
@@ -2198,10 +2249,10 @@ def get_tasks_paginated(data, db):
             return jsonify({"error": "planId is required", "success": False}), 400
 
         task_type = data.get("taskType")
-        page_size = data.get("pageSize", 20)
+        page_size = _resolve_page_size(data.get("pageSize", DEFAULT_PAGE_SIZE))
         last_document = data.get("lastDocument")  # offset index or taskId string
         target_date_filter = data.get("targetDateFilter", "all")
-        
+
         # Filters
         filter_client_id = data.get("filterClientId")
         filter_product_id = data.get("filterProductId")
@@ -2221,16 +2272,6 @@ def get_tasks_paginated(data, db):
                     filter_city_client_ids = list(set(filter_city_client_ids).intersection(set(resolved_ids)))
             except Exception as e:
                 print(f"Error resolving city clients: {e}")
-
-        # Check if any user filter is active
-        has_active_filter = bool(
-            filter_client_id or
-            filter_product_id or
-            filter_status or
-            filter_priority or
-            filter_city or
-            filter_city_client_ids is not None
-        )
 
         # Query all tasks for the plan
         tasks_query = (
@@ -2254,14 +2295,15 @@ def get_tasks_paginated(data, db):
             if task_type and task.get("taskType") != task_type:
                 continue
 
-            # TargetDate filter
+            # TargetDate filter. It is a dimension of its own — the screen that
+            # asks for the tasks still missing a date means it whether or not
+            # the user also narrowed by client, product or city — so it applies
+            # alongside the filters below, never instead of them.
             target_date = task.get("targetDate")
-            # Ignore targetDateFilter if any user filter is active
-            if not has_active_filter:
-                if target_date_filter == "withDate" and target_date is None:
-                    continue
-                elif target_date_filter == "withoutDate" and target_date is not None:
-                    continue
+            if target_date_filter == "withDate" and target_date is None:
+                continue
+            elif target_date_filter == "withoutDate" and target_date is not None:
+                continue
 
             # Client ID filter
             if filter_client_id and task.get("clientId") != filter_client_id:
@@ -2330,18 +2372,33 @@ def get_tasks_paginated(data, db):
 
             filtered_tasks.append(task)
 
-        # Helper to parse targetDate / createdAt for sorting
+        # Helper to parse targetDate / createdAt for sorting.
+        #
+        # A plan holds both shapes of createdAt: a task this function created
+        # carries a Firestore timestamp, which is tz-aware UTC, while a task the
+        # app created carries `DateTime.toIso8601String()` of a *local* time,
+        # which Dart writes with no offset at all. Python refuses to compare the
+        # two, so a plan containing both used to kill the sort below with
+        # "can't compare offset-naive and offset-aware datetimes" — a 500 that
+        # the plan screen shows as an empty list. Everything is therefore pulled
+        # onto one aware timeline before it reaches the sort.
         def parse_datetime(val):
-            if not val:
-                return datetime.min
+            parsed = None
             if isinstance(val, datetime):
-                return val
-            if isinstance(val, str):
+                parsed = val
+            elif isinstance(val, str) and val:
                 try:
-                    return datetime.fromisoformat(val.replace("Z", "+00:00"))
-                except Exception:
-                    pass
-            return datetime.min
+                    parsed = datetime.fromisoformat(val.replace("Z", "+00:00"))
+                except ValueError:
+                    parsed = None
+            if parsed is None:
+                # Sorts oldest, so a task with no usable createdAt lands at the
+                # end of the newest-first list rather than the top of it.
+                return datetime.min.replace(tzinfo=timezone.utc)
+            if parsed.tzinfo is None:
+                # Written by the app, whose clock reads Iraq local time.
+                return parsed.replace(tzinfo=IRAQ_TIMEZONE)
+            return parsed
 
         # Sort tasks descending by createdAt, and then by document id
         filtered_tasks.sort(
@@ -2387,7 +2444,9 @@ def get_tasks_paginated(data, db):
             "success": True,
             "tasks": serialized_tasks,
             "hasMore": has_more,
-            "lastDocument": next_last_document
+            "lastDocument": next_last_document,
+            # How many tasks match the query in total, not just in this page.
+            "total": len(filtered_tasks),
         }), 200
 
     except Exception as e:
