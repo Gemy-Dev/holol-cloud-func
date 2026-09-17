@@ -273,19 +273,7 @@ def handle_send_notification(decoded_token, data, db):
                 "reason": "no_valid_registration"
             }), 200
 
-        # Prepare message data
-        message_data = {}
-
-        if notification_action:
-            if isinstance(notification_action, dict):
-                import json
-                for k, v in notification_action.items():
-                    if isinstance(v, (dict, list)):
-                        message_data[str(k)] = json.dumps(v)
-                    else:
-                        message_data[str(k)] = str(v)
-            else:
-                message_data["action"] = str(notification_action)
+        message_data = _message_data(notification_action)
 
         # Build FCM message
         message = messaging.Message(
@@ -373,6 +361,48 @@ def _prune_token(db, user_id, token):
         return 0
 
 
+def _message_data(notification_action):
+    """The FCM ``data`` payload for a caller's ``notificationAction``.
+
+    A map is spread into string entries (nested values JSON-encoded, since FCM
+    data values must be strings); anything else becomes the ``action`` entry.
+    """
+    message_data = {}
+    if not notification_action:
+        return message_data
+    if isinstance(notification_action, dict):
+        import json
+        for k, v in notification_action.items():
+            if isinstance(v, (dict, list)):
+                message_data[str(k)] = json.dumps(v)
+            else:
+                message_data[str(k)] = str(v)
+    else:
+        message_data["action"] = str(notification_action)
+    return message_data
+
+
+def _prune_failed_sends(db, response, tokens, token_owners):
+    """Clear every registration a multicast send reports as gone for good.
+
+    Left in place they are retried on every send forever, dragging the delivery
+    rate down and hiding the fact that a real user has stopped receiving.
+    ``token_owners[i]`` is the user holding ``tokens[i]``. Returns the count.
+    """
+    pruned = 0
+    if response.failure_count > 0:
+        for idx, resp in enumerate(response.responses):
+            if resp.success:
+                continue
+            print(f"❌ Failed to send to token {idx}: {resp.exception}")
+            if _is_permanently_invalid_token(resp.exception):
+                pruned += _prune_token(db, token_owners[idx], tokens[idx])
+
+    if pruned:
+        print(f"🧹 Cleared {pruned} dead device registration(s)")
+    return pruned
+
+
 def handle_send_notification_to_all(decoded_token, data, db):
     """Send a notification to all users who have FCM tokens."""
     try:
@@ -389,18 +419,7 @@ def handle_send_notification_to_all(decoded_token, data, db):
         # Get the sender's UID so we can exclude them from recipients
         sender_id = data.get("senderId") or decoded_token.get("uid")
         
-        # Build message data
-        message_data = {}
-        if notification_action:
-            if isinstance(notification_action, dict):
-                import json
-                for k, v in notification_action.items():
-                    if isinstance(v, (dict, list)):
-                        message_data[str(k)] = json.dumps(v)
-                    else:
-                        message_data[str(k)] = str(v)
-            else:
-                message_data["action"] = str(notification_action)
+        message_data = _message_data(notification_action)
         
         # The audience, per data-model.md §2. The preference and the active
         # flag are a composite Firestore query; excluding the sender and
@@ -471,20 +490,7 @@ def handle_send_notification_to_all(decoded_token, data, db):
             
             print(f"✅ Sent to {success_count} users, {failure_count} failed")
 
-            # Clear registrations FCM says are gone for good. Left in place they
-            # are retried on every send forever, dragging the delivery rate down
-            # and hiding the fact that a real user has stopped receiving.
-            pruned = 0
-            if failure_count > 0:
-                for idx, resp in enumerate(response.responses):
-                    if resp.success:
-                        continue
-                    print(f"❌ Failed to send to token {idx}: {resp.exception}")
-                    if _is_permanently_invalid_token(resp.exception):
-                        pruned += _prune_token(db, token_owners[idx], tokens[idx])
-
-            if pruned:
-                print(f"🧹 Cleared {pruned} dead device registration(s)")
+            pruned = _prune_failed_sends(db, response, tokens, token_owners)
 
             return jsonify({
                 "success": True,
@@ -504,6 +510,151 @@ def handle_send_notification_to_all(decoded_token, data, db):
             
     except Exception as e:
         error_msg = f"Error sending notification to all: {str(e)}"
+        print(error_msg)
+        print(traceback.format_exc())
+        return jsonify({
+            "success": False,
+            "error": error_msg
+        }), 500
+
+
+# Every spelling each reviewer role has been stored under. The dashboard writes
+# the enum name, but accounts created before it did carry the English or Arabic
+# label — the set the dashboard's UserRoleTemplate.fromStorageValue accepts.
+_ROLE_SPELLINGS = {
+    "admin": ["admin", "Admin", "ADMIN", "مسؤول النظام"],
+    "salesManager": [
+        "salesManager",
+        "Sales Manager",
+        "sales manager",
+        "sales_manager",
+        "مدير المبيعات",
+    ],
+}
+
+# A review signed in one slot is reported to the holders of the other role.
+_OTHER_REVIEWER_ROLE = {"salesManager": "admin", "admin": "salesManager"}
+
+
+def _unreachable_reason(user_id, user, actor_id):
+    """Why ``user`` cannot be notified, or None when they can.
+
+    The broadcast audience's rules (data-model.md §2), applied in code because
+    a named recipient is read by id or by role rather than through the audience
+    query. ``"actor"`` marks the person who performed the action.
+    """
+    if actor_id and user_id == actor_id:
+        return "actor"
+    if user.get("receiveEmailNotifications") is not True:
+        return "preference_off"
+    if user.get("isActive") is not True:
+        return "inactive"
+    if not user.get("fcmToken"):
+        return "no_valid_registration"
+    return None
+
+
+def handle_send_review_notification(decoded_token, data, db):
+    """Notify the representative and the other manager role about a review.
+
+    Spec 2035 FR-015/FR-016: a sales manager's review reaches the representative
+    who carried out the work and every system administrator; an administrator's
+    review reaches the representative and every sales manager. Recipients are
+    resolved here because the field app cannot read other users' documents.
+
+    The reviewer is never told about their own review (FR-022), and a recipient
+    who cannot be reached never stops the others — each is reported back under
+    ``unreachable`` instead (FR-024).
+    """
+    try:
+        title = data.get("title")
+        body = data.get("body")
+        if not title or not body:
+            return jsonify({
+                "success": False,
+                "error": "title and body are required"
+            }), 400
+
+        other_role = _OTHER_REVIEWER_ROLE.get(data.get("reviewerRole"))
+        if other_role is None:
+            return jsonify({
+                "success": False,
+                "error": "reviewerRole must be salesManager or admin"
+            }), 400
+
+        # Taken from the verified token, not the payload, so a caller cannot
+        # exclude or impersonate someone else as the reviewer.
+        reviewer_id = decoded_token.get("uid")
+        representative_id = data.get("representativeId")
+        users = db.collection("users")
+
+        candidates = {}
+        unreachable = []
+        if representative_id:
+            snapshot = users.document(representative_id).get()
+            if snapshot.exists:
+                candidates[representative_id] = snapshot.to_dict() or {}
+            else:
+                unreachable.append({"userId": representative_id, "reason": "not_found"})
+
+        # A single-field `in` filter needs no composite index.
+        role_holders = users.where("role", "in", _ROLE_SPELLINGS[other_role])
+        for user_doc in role_holders.stream():
+            candidates.setdefault(user_doc.id, user_doc.to_dict() or {})
+
+        tokens = []
+        token_owners = []
+        for user_id, user in candidates.items():
+            reason = _unreachable_reason(user_id, user, reviewer_id)
+            if reason == "actor":
+                continue
+            if reason:
+                unreachable.append({"userId": user_id, "reason": reason})
+                continue
+            # One device signed in to two of the recipients still alerts once.
+            if user["fcmToken"] in tokens:
+                continue
+            tokens.append(user["fcmToken"])
+            token_owners.append(user_id)
+
+        for entry in unreachable:
+            print(f"📭 Review recipient {entry['userId']} unreachable: {entry['reason']}")
+
+        if not tokens:
+            return jsonify({
+                "success": True,
+                "message": "Notification sent to 0 users",
+                "successCount": 0,
+                "failureCount": 0,
+                "totalTokens": 0,
+                "prunedTokens": 0,
+                "unreachable": unreachable
+            }), 200
+
+        message = messaging.MulticastMessage(
+            tokens=tokens,
+            notification=messaging.Notification(title=title, body=body),
+            data=_message_data(data.get("notificationAction")) or None
+        )
+        response = messaging.send_each_for_multicast(message)  # type: ignore[attr-defined]
+        pruned = _prune_failed_sends(db, response, tokens, token_owners)
+        print(
+            f"✅ Review notification sent to {response.success_count} users, "
+            f"{response.failure_count} failed"
+        )
+
+        return jsonify({
+            "success": True,
+            "message": f"Notification sent to {response.success_count} users",
+            "successCount": response.success_count,
+            "failureCount": response.failure_count,
+            "totalTokens": len(tokens),
+            "prunedTokens": pruned,
+            "unreachable": unreachable
+        }), 200
+
+    except Exception as e:
+        error_msg = f"Error sending review notification: {str(e)}"
         print(error_msg)
         print(traceback.format_exc())
         return jsonify({

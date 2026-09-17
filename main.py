@@ -42,6 +42,7 @@ from modules.notifications import (
     handle_daily_notifications,
     handle_send_notification,
     handle_send_notification_to_all,
+    handle_send_review_notification,
 )
 from modules.email import send_email, send_daily_report, notify_new_deal, send_support_visit_report
 from modules.apk_manager import (
@@ -216,6 +217,11 @@ def route_request(action, data, request):
     
     elif action == "sendNotificationToAll":
         return handle_send_notification_to_all(decoded_token, data, db)
+
+    elif action == "sendReviewNotification":
+        # Spec 2035 US4: the representative plus holders of the other
+        # reviewer role, resolved server-side.
+        return handle_send_review_notification(decoded_token, data, db)
 
     elif action == "migrateNotificationPreference":
         # One-time admin backfill onto the canonical preference key.
