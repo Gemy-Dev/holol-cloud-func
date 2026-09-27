@@ -5,71 +5,88 @@ from flask import jsonify, request
 from datetime import datetime
 import os
 
+from modules import notification_log
 
-def _send_notifications_to_android_users(version, db):
+
+def _send_notifications_to_android_users(version, db, sender_id=None, source="dashboard"):
     """
     Send Arabic notifications to all users with Android platform.
+
+    One record in ``notifications`` names every Android user, so the update
+    also reaches the notification list of someone whose device is not
+    registered.
 
     Args:
         version: APK version that was uploaded
         db: Firestore database instance
+        sender_id: The uploading admin's uid
+        source: Which client made the request
 
     Returns:
         Tuple of (notification_count, errors)
     """
     notification_count = 0
     errors = []
+    title = "نسخة جديدة متاحة"  # "New version available"
+    body = f"يرجى تحديث التطبيق إلى النسخة {version}"  # "Please update the app to version X.X.X"
+    message_data = {
+        "version": version,
+        "action": "apk_update",
+        "type": "app_update"
+    }
 
     try:
-        # Get all users
-        users_query = db.collection("users").stream()
+        # (user id, token or None) for every Android user
+        recipients = []
+        for user_doc in db.collection("users").stream():
+            user_data = user_doc.to_dict() or {}
 
-        for user_doc in users_query:
+            # Check if "android" is in platforms list
+            platforms = user_data.get("platforms", [])
+            if not isinstance(platforms, list):
+                continue
+            if "android" not in [str(p).lower() for p in platforms]:
+                continue
+
+            recipients.append((user_doc.id, user_data.get("fcmToken")))
+
+        notification_id = notification_log.record(
+            db,
+            title=title,
+            body=body,
+            data=message_data,
+            kind="apk_update",
+            source=source,
+            sender_id=sender_id,
+            recipient_ids=[user_id for user_id, _ in recipients],
+        )
+        push_data = {**message_data, "notificationId": notification_id} if notification_id else message_data
+        badges = notification_log.todays_counts(db, [user_id for user_id, _ in recipients])
+
+        for user_id, fcm_token in recipients:
+            if not fcm_token:
+                continue
+
+            message = messaging.Message(
+                token=fcm_token,
+                notification=messaging.Notification(title=title, body=body),
+                data=push_data,
+                **notification_log.badge_config(badges.get(user_id))
+            )
+
+            # Send notification
             try:
-                user_data = user_doc.to_dict()
-
-                # Check if user has Android platform
-                platforms = user_data.get("platforms", [])
-                if not isinstance(platforms, list):
-                    continue
-
-                # Check if "android" is in platforms list
-                if "android" not in [p.lower() for p in platforms]:
-                    continue
-
-                # Get FCM token
-                fcm_token = user_data.get("fcmToken")
-                if not fcm_token:
-                    continue
-
-                # Prepare Arabic message
-                message = messaging.Message(
-                    token=fcm_token,
-                    notification=messaging.Notification(
-                        title="نسخة جديدة متاحة",  # "New version available"
-                        body=f"يرجى تحديث التطبيق إلى النسخة {version}"  # "Please update the app to version X.X.X"
-                    ),
-                    data={
-                        "version": version,
-                        "action": "apk_update",
-                        "type": "app_update"
-                    }
-                )
-
-                # Send notification
-                try:
-                    response = messaging.send(message)
-                    notification_count += 1
-                    print(f"✅ APK update notification sent to {user_doc.id} (Android): {response}")
-                except Exception as send_error:
-                    error_msg = f"Error sending to {user_doc.id}: {str(send_error)}"
-                    errors.append(error_msg)
-                    print(f"❌ {error_msg}")
-
-            except Exception as user_error:
-                error_msg = f"Error processing user {user_doc.id}: {str(user_error)}"
+                response = messaging.send(message)
+                notification_count += 1
+                print(f"✅ APK update notification sent to {user_id} (Android): {response}")
+            except Exception as send_error:
+                error_msg = f"Error sending to {user_id}: {str(send_error)}"
                 errors.append(error_msg)
                 print(f"❌ {error_msg}")
+
+        notification_log.record_delivery(
+            db, notification_id, success_count=notification_count, failure_count=len(errors)
+        )
 
     except Exception as query_error:
         error_msg = f"Error querying users: {str(query_error)}"
@@ -209,7 +226,9 @@ def upload_apks(data, decoded_token, db):
         db.collection("downloads").document(version).set(downloads_doc)
 
         # Send Arabic notifications to Android users
-        notification_count, notification_errors = _send_notifications_to_android_users(version, db)
+        notification_count, notification_errors = _send_notifications_to_android_users(
+            version, db, sender_id=uid, source=notification_log.request_source(data)
+        )
 
         return jsonify({
             "success": True,

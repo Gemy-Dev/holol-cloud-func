@@ -15,3 +15,8 @@
 
 node_modules
 #!include:.gitignore
+
+# Local test environment — never part of the function.
+.venv/
+__pycache__/
+.pytest_cache/

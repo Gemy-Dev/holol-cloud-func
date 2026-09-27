@@ -5,6 +5,7 @@ import traceback
 from datetime import datetime, date, timezone, timedelta
 from email.utils import parsedate_to_datetime
 from modules.config import IRAQ_TIMEZONE
+from modules import notification_log
 import random
 
 
@@ -137,7 +138,7 @@ def _normalize_target_date(value):
 
 
 def handle_daily_notifications(db, days_offset=0):
-    """Handle task notifications for a specific date.
+    """Remind each representative of their own tasks for a specific date.
     
     Args:
         db: Firestore database instance
@@ -154,69 +155,107 @@ def handle_daily_notifications(db, days_offset=0):
         
         print(f"🔔 Running task notifications for date: {target_date} (offset: {days_offset})")
 
-        users_ref = db.collection("users").stream()
-        notification_count = 0
-        
-        for user_doc in users_ref:
-            user = user_doc.to_dict()
-            fcm_token = user.get("fcmToken")
-            if not fcm_token:
+        # Read the day's tasks once, grouped by assignee. This used to re-read
+        # every task for every user and tell each of them about every task due
+        # that day, whoever it belonged to — which the stored notification
+        # list would now have shown to everyone.
+        tasks_by_user = {}
+        for task_doc in db.collection("tasks").stream():
+            task = task_doc.to_dict() or {}
+            if task.get("reviewState") == "deleted":
+                continue
+            assignee = task.get("assignedToId")
+            if not assignee:
+                continue
+            if _normalize_target_date(task.get("targetDate")) != target_date:
+                continue
+            tasks_by_user.setdefault(assignee, []).append({
+                "id": task_doc.id,
+                "title": task.get("title", "بدون عنوان")
+            })
+
+        # Record every reminder before sending any, so the badge counts below
+        # include the reminder each device is about to receive.
+        reminders = []
+        for user_id, user_tasks in tasks_by_user.items():
+            user_snapshot = db.collection("users").document(user_id).get()
+            if not user_snapshot.exists:
                 continue
 
-            # Collect all tasks for this user that are due on target date
-            tasks_ref = db.collection("tasks").stream()
-            today_tasks = []
-            
-            for task_doc in tasks_ref:
-                task = task_doc.to_dict()
-                task_date = task.get("targetDate")
+            # A fixed id per user, date and run: the scheduler has held two
+            # jobs for the same 05:00 run, and a second run must not remind
+            # anyone twice.
+            reminder_id = f"daily_tasks-{target_date}-{days_offset}-{user_id}"
+            if db.collection(notification_log.COLLECTION).document(reminder_id).get().exists:
+                continue
 
-                # Normalize various date formats to ISO date string (YYYY-MM-DD)
-                normalized = _normalize_target_date(task_date)
-                if normalized == target_date:
-                    today_tasks.append({
-                        "id": task_doc.id,
-                        "title": task.get("title", "بدون عنوان")
-                    })
+            task_count = len(user_tasks)
+            task_ids = [task["id"] for task in user_tasks]
             
-            # Send notification only if there are tasks due on target date
-            if today_tasks:
-                task_count = len(today_tasks)
-                task_ids = [task["id"] for task in today_tasks]
-                
-                # Create notification body based on offset
-                if days_offset == 0:
-                    # Today's tasks
-                    if task_count == 1:
-                        body = f"عندك اليوم مهمة: {today_tasks[0]['title']}"
-                    else:
-                        body = f"عندك اليوم {task_count} مهام"
+            # Create notification body based on offset
+            if days_offset == 0:
+                # Today's tasks
+                if task_count == 1:
+                    body = f"عندك اليوم مهمة: {user_tasks[0]['title']}"
                 else:
-                    # Tomorrow's tasks
-                    if task_count == 1:
-                        body = f"عندك غدا مهمة: {today_tasks[0]['title']}"
-                    else:
-                        body = f"عندك غدا {task_count} مهام"
-                
-                message = messaging.Message(
-                    token=fcm_token,
-                    notification=messaging.Notification(
-                        title="تذكير بالمهام",
-                        body=body
-                    ),
-                    data={
-                        "taskCount": str(task_count),
-                        "taskIds": ",".join(task_ids),
-                        "date": target_date,
-                        "action": "daily_tasks"
-                    }
+                    body = f"عندك اليوم {task_count} مهام"
+            else:
+                # Tomorrow's tasks
+                if task_count == 1:
+                    body = f"عندك غدا مهمة: {user_tasks[0]['title']}"
+                else:
+                    body = f"عندك غدا {task_count} مهام"
+
+            message_data = {
+                "taskCount": str(task_count),
+                "taskIds": ",".join(task_ids),
+                "date": target_date,
+                "action": "daily_tasks"
+            }
+            notification_id = notification_log.record(
+                db,
+                title="تذكير بالمهام",
+                body=body,
+                data=message_data,
+                kind="daily_tasks",
+                source="system",
+                sender_id=None,
+                recipient_ids=[user_id],
+                notification_id=reminder_id,
+            )
+            reminders.append((user_id, (user_snapshot.to_dict() or {}).get("fcmToken"),
+                              body, message_data, notification_id))
+
+        badges = notification_log.todays_counts(db, [reminder[0] for reminder in reminders])
+        notification_count = 0
+
+        for user_id, fcm_token, body, message_data, notification_id in reminders:
+            if not fcm_token:
+                notification_log.record_delivery(
+                    db, notification_id, success_count=0, failure_count=0,
+                    reason="no_valid_registration"
                 )
-                try:
-                    response = messaging.send(message)
-                    notification_count += 1
-                    print(f"✅ Sent to {user_doc.id}: {task_count} tasks, IDs: {task_ids}")
-                except Exception as e:
-                    print(f"❌ Error sending to {user_doc.id}: {str(e)}")
+                continue
+
+            if notification_id:
+                message_data = {**message_data, "notificationId": notification_id}
+            message = messaging.Message(
+                token=fcm_token,
+                notification=messaging.Notification(
+                    title="تذكير بالمهام",
+                    body=body
+                ),
+                data=message_data,
+                **notification_log.badge_config(badges.get(user_id))
+            )
+            try:
+                messaging.send(message)
+                notification_count += 1
+                notification_log.record_delivery(db, notification_id, success_count=1, failure_count=0)
+                print(f"✅ Sent to {user_id}: {message_data['taskCount']} tasks")
+            except Exception as e:
+                notification_log.record_delivery(db, notification_id, success_count=0, failure_count=1)
+                print(f"❌ Error sending to {user_id}: {str(e)}")
         
         return jsonify({
             "success": True, 
@@ -239,8 +278,12 @@ def handle_send_notification(decoded_token, data, db):
     ``targetUserId`` is the path callers should use: the field app has no read
     access to another user's document, so requiring an ``fcmToken`` up front
     meant it could never address anyone but itself and fell back to
-    broadcasting instead. ``fcmToken`` stays accepted for existing callers.
+    broadcasting instead. ``fcmToken`` stays accepted for existing callers,
+    and its owner is looked up so the stored record still names a recipient.
     """
+    target_user_id = None
+    fcm_token = None
+    notification_id = None
     try:
         target_user_id = data.get("targetUserId")
         fcm_token = data.get("fcmToken")
@@ -262,29 +305,52 @@ def handle_send_notification(decoded_token, data, db):
         if target_user_id:
             snapshot = db.collection("users").document(target_user_id).get()
             fcm_token = (snapshot.to_dict() or {}).get("fcmToken") if snapshot.exists else None
+        else:
+            target_user_id = _token_owner(db, fcm_token)
+
+        message_data = _message_data(notification_action)
+        notification_id = notification_log.record(
+            db,
+            title=title,
+            body=body,
+            data=message_data,
+            kind="direct",
+            source=notification_log.request_source(data),
+            sender_id=decoded_token.get("uid"),
+            recipient_ids=[target_user_id] if target_user_id else [],
+        )
 
         if not fcm_token:
             # Not an error: the user simply has no device registered. Reporting
             # this as a failure would make an ordinary state look like an
-            # outage every time someone had not installed the app yet.
+            # outage every time someone had not installed the app yet. The
+            # record above still reaches their notification list.
             print(f"📭 No valid registration for user {target_user_id}")
+            notification_log.record_delivery(
+                db, notification_id, success_count=0, failure_count=0,
+                reason="no_valid_registration"
+            )
             return jsonify({
                 "success": False,
                 "reason": "no_valid_registration"
             }), 200
 
-        message_data = _message_data(notification_action)
+        if notification_id:
+            message_data["notificationId"] = notification_id
+        badge = notification_log.todays_counts(db, [target_user_id]).get(target_user_id)
 
         # Build FCM message
         message = messaging.Message(
             token=fcm_token,
             notification=messaging.Notification(title=title, body=body),
-            data=message_data  # always a dict
+            data=message_data,  # always a dict
+            **notification_log.badge_config(badge)
         )
 
         # Send notification
         response = messaging.send(message)
         print(f"✅ Notification sent successfully: {response}")
+        notification_log.record_delivery(db, notification_id, success_count=1, failure_count=0)
 
         return jsonify({
             "success": True,
@@ -295,12 +361,14 @@ def handle_send_notification(decoded_token, data, db):
     except messaging.UnregisteredError:
         # 200, not 400: the request was well-formed and the outcome is known
         # and final. Clear the registration so it is not retried forever —
-        # only possible when addressed by id, since a raw token carries no
-        # owner and finding one would need a query with no index behind it.
+        # possible whenever the token's owner is known, by id or by lookup.
+        notification_log.record_delivery(
+            db, notification_id, success_count=0, failure_count=1, reason="token_pruned"
+        )
         if target_user_id:
             _prune_token(db, target_user_id, fcm_token)
         else:
-            print("⚠️ Unregistered token supplied directly — no owner to clear")
+            print("⚠️ Unregistered token has no owner to clear")
 
         return jsonify({
             "success": False,
@@ -311,11 +379,27 @@ def handle_send_notification(decoded_token, data, db):
         error_msg = f"Error sending notification: {str(e)}"
         print(f"❌ {error_msg}")
         print(traceback.format_exc())
+        notification_log.record_delivery(
+            db, notification_id, success_count=0, failure_count=1, reason="error"
+        )
 
         return jsonify({
             "success": False,
             "error": error_msg
         }), 500
+
+
+def _token_owner(db, fcm_token):
+    """The id of the user holding ``fcm_token``, or None. Never raises.
+
+    A single-field equality filter, served by Firestore's automatic index.
+    """
+    try:
+        for user_doc in db.collection("users").where("fcmToken", "==", fcm_token).limit(1).stream():
+            return user_doc.id
+    except Exception as error:
+        print(f"⚠️ Could not resolve the owner of a token: {error}")
+    return None
 
 
 def _is_permanently_invalid_token(exception):
@@ -403,6 +487,36 @@ def _prune_failed_sends(db, response, tokens, token_owners):
     return pruned
 
 
+def _send_multicast(db, tokens, token_owners, title, body, message_data, badges):
+    """Send one notification to ``tokens``, each device showing its owner's badge.
+
+    Devices are grouped by badge value, so a broadcast is still a handful of
+    multicast calls rather than one call per device. ``badges`` maps a user id
+    to today's count; an owner missing from it gets no badge.
+
+    Returns ``(success_count, failure_count, pruned_count)``.
+    """
+    groups = {}
+    for token, owner in zip(tokens, token_owners):
+        group_tokens, group_owners = groups.setdefault(badges.get(owner), ([], []))
+        group_tokens.append(token)
+        group_owners.append(owner)
+
+    success_count = failure_count = pruned = 0
+    for badge, (group_tokens, group_owners) in groups.items():
+        message = messaging.MulticastMessage(
+            tokens=group_tokens,
+            notification=messaging.Notification(title=title, body=body),
+            data=message_data or None,
+            **notification_log.badge_config(badge)
+        )
+        response = messaging.send_each_for_multicast(message)  # type: ignore[attr-defined]
+        success_count += response.success_count
+        failure_count += response.failure_count
+        pruned += _prune_failed_sends(db, response, group_tokens, group_owners)
+    return success_count, failure_count, pruned
+
+
 def handle_send_notification_to_all(decoded_token, data, db):
     """Send a notification to all users who have FCM tokens."""
     try:
@@ -416,8 +530,10 @@ def handle_send_notification_to_all(decoded_token, data, db):
                 "error": "title and body are required"
             }), 400
         
-        # Get the sender's UID so we can exclude them from recipients
-        sender_id = data.get("senderId") or decoded_token.get("uid")
+        # Taken from the verified token only. A payload `senderId` used to win,
+        # which let any caller exclude someone else from a broadcast — and
+        # would now let them sign a stored notification with another name.
+        sender_id = decoded_token.get("uid")
         
         message_data = _message_data(notification_action)
         
@@ -457,11 +573,25 @@ def handle_send_notification_to_all(decoded_token, data, db):
             tokens.append(fcm_token)
             token_owners.append(user_doc.id)
 
+        # Stored for everyone, not only the push audience above: the
+        # preference switches off the phone alert, not the notification list.
+        notification_id = notification_log.record(
+            db,
+            title=title,
+            body=body,
+            data=message_data,
+            kind="broadcast",
+            source=notification_log.request_source(data),
+            sender_id=sender_id,
+            recipient_ids=[notification_log.ALL],
+        )
+
         if not tokens:
             # A valid outcome, not an error. FR-023 keeps the record saved
             # regardless, and the previous 404 read to the caller as a failure
             # to save the record that triggered the notification.
             print("📭 No eligible recipients — nothing to send")
+            notification_log.record_delivery(db, notification_id, success_count=0, failure_count=0)
             return jsonify({
                 "success": True,
                 "message": "Notification sent to 0 users",
@@ -472,25 +602,20 @@ def handle_send_notification_to_all(decoded_token, data, db):
             }), 200
 
         print(f"📢 Sending notification to {len(tokens)} users (excluded sender: {sender_id})")
-        
-        # Build multicast message
-        message = messaging.MulticastMessage(
-            tokens=tokens,
-            notification=messaging.Notification(
-                title=title,
-                body=body
-            ),
-            data=message_data if message_data else None
-        )
-        
-        try:
-            response = messaging.send_each_for_multicast(message)  # type: ignore[attr-defined]
-            success_count = response.success_count
-            failure_count = response.failure_count
-            
-            print(f"✅ Sent to {success_count} users, {failure_count} failed")
 
-            pruned = _prune_failed_sends(db, response, tokens, token_owners)
+        if notification_id:
+            message_data["notificationId"] = notification_id
+        badges = notification_log.todays_counts(db, token_owners)
+
+        try:
+            success_count, failure_count, pruned = _send_multicast(
+                db, tokens, token_owners, title, body, message_data, badges
+            )
+            notification_log.record_delivery(
+                db, notification_id, success_count=success_count, failure_count=failure_count
+            )
+
+            print(f"✅ Sent to {success_count} users, {failure_count} failed")
 
             return jsonify({
                 "success": True,
@@ -503,6 +628,9 @@ def handle_send_notification_to_all(decoded_token, data, db):
         except Exception as send_error:
             error_msg = str(send_error)
             print(f"❌ Error sending multicast notification: {error_msg}")
+            notification_log.record_delivery(
+                db, notification_id, success_count=0, failure_count=len(tokens), reason="error"
+            )
             return jsonify({
                 "success": False,
                 "error": f"Failed to send notifications: {error_msg}"
@@ -620,7 +748,22 @@ def handle_send_review_notification(decoded_token, data, db):
         for entry in unreachable:
             print(f"📭 Review recipient {entry['userId']} unreachable: {entry['reason']}")
 
+        # Every named recipient is stored, reachable or not: an unreachable
+        # phone is exactly when the in-app list is the only way to find out.
+        message_data = _message_data(data.get("notificationAction"))
+        notification_id = notification_log.record(
+            db,
+            title=title,
+            body=body,
+            data=message_data,
+            kind="review",
+            source=notification_log.request_source(data),
+            sender_id=reviewer_id,
+            recipient_ids=[user_id for user_id in candidates if user_id != reviewer_id],
+        )
+
         if not tokens:
+            notification_log.record_delivery(db, notification_id, success_count=0, failure_count=0)
             return jsonify({
                 "success": True,
                 "message": "Notification sent to 0 users",
@@ -631,23 +774,25 @@ def handle_send_review_notification(decoded_token, data, db):
                 "unreachable": unreachable
             }), 200
 
-        message = messaging.MulticastMessage(
-            tokens=tokens,
-            notification=messaging.Notification(title=title, body=body),
-            data=_message_data(data.get("notificationAction")) or None
+        if notification_id:
+            message_data["notificationId"] = notification_id
+        badges = notification_log.todays_counts(db, token_owners)
+        success_count, failure_count, pruned = _send_multicast(
+            db, tokens, token_owners, title, body, message_data, badges
         )
-        response = messaging.send_each_for_multicast(message)  # type: ignore[attr-defined]
-        pruned = _prune_failed_sends(db, response, tokens, token_owners)
+        notification_log.record_delivery(
+            db, notification_id, success_count=success_count, failure_count=failure_count
+        )
         print(
-            f"✅ Review notification sent to {response.success_count} users, "
-            f"{response.failure_count} failed"
+            f"✅ Review notification sent to {success_count} users, "
+            f"{failure_count} failed"
         )
 
         return jsonify({
             "success": True,
-            "message": f"Notification sent to {response.success_count} users",
-            "successCount": response.success_count,
-            "failureCount": response.failure_count,
+            "message": f"Notification sent to {success_count} users",
+            "successCount": success_count,
+            "failureCount": failure_count,
             "totalTokens": len(tokens),
             "prunedTokens": pruned,
             "unreachable": unreachable

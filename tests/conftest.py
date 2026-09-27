@@ -130,6 +130,14 @@ class _FakeQuery:
             elif op == 'in':
                 if doc_val in value:
                     filtered.append(doc)
+            elif op in ('>=', '>', '<=', '<'):
+                # Firestore range filters skip documents whose value is
+                # missing or of another type — mirrored here for strings.
+                if not isinstance(doc_val, type(value)):
+                    continue
+                if ((op == '>=' and doc_val >= value) or (op == '>' and doc_val > value)
+                        or (op == '<=' and doc_val <= value) or (op == '<' and doc_val < value)):
+                    filtered.append(doc)
         return _FakeQuery(filtered)
 
     def limit(self, n: int) -> '_FakeQuery':
