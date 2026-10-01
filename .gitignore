@@ -67,3 +67,9 @@ node_modules/
 
 # dataconnect generated files
 .dataconnect
+
+# Python: the local test environment and bytecode
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/

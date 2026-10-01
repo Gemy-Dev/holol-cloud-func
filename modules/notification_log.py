@@ -11,7 +11,8 @@ Document shape, ``notifications/{id}``:
     title, body   what the recipient saw
     data          the FCM data payload — the ``action`` and record ids that open
                   the record when the notification is tapped
-    kind          direct | broadcast | review | daily_tasks | apk_update
+    kind          direct | broadcast | review | daily_tasks | apk_update |
+                  review_request | review_digest | special_request
     source        app | dashboard | system
     senderId      uid from the verified ID token; None for the scheduler
     senderName    the sender's name at send time, for display
@@ -28,6 +29,7 @@ addressed to them, or when it is a broadcast somebody else sent — the rule
 from datetime import datetime
 
 from firebase_admin import messaging
+from google.api_core.exceptions import AlreadyExists
 
 from modules.config import IRAQ_TIMEZONE
 from modules.dates import now_iso, to_iso
@@ -67,8 +69,14 @@ def sender_name(db, sender_id):
         return None
 
 
+# Returned by ``record(create_only=True)`` when the fixed id is already taken.
+# Distinct from ``None`` (the write failed): a taken id means "already sent, do
+# not push again", a failed write means "push anyway" (research R16).
+ALREADY_RECORDED = object()
+
+
 def record(db, *, title, body, data, kind, source, sender_id, recipient_ids,
-           notification_id=None):
+           notification_id=None, create_only=False):
     """Write the record and return its id, or None if the write failed.
 
     Written before the send, so a send that dies halfway is still on record.
@@ -78,11 +86,13 @@ def record(db, *, title, body, data, kind, source, sender_id, recipient_ids,
     Args:
         recipient_ids: ``[ALL]`` for a broadcast, else the addressed uids.
         notification_id: a fixed document id, for callers that dedupe on it.
+        create_only: claim ``notification_id`` atomically with ``create()``;
+            returns ``ALREADY_RECORDED`` when it exists. Needs a fixed id.
     """
     try:
         collection = db.collection(COLLECTION)
         ref = collection.document(notification_id) if notification_id else collection.document()
-        ref.set({
+        payload = {
             "id": ref.id,
             "title": title,
             "body": body,
@@ -94,8 +104,14 @@ def record(db, *, title, body, data, kind, source, sender_id, recipient_ids,
             "audience": "all" if ALL in recipient_ids else "users",
             "recipientIds": list(recipient_ids),
             "createdAt": now_iso(),
-        })
+        }
+        if create_only:
+            ref.create(payload)
+        else:
+            ref.set(payload)
         return ref.id
+    except AlreadyExists:
+        return ALREADY_RECORDED
     except Exception as error:
         print(f"⚠️ Could not record notification '{title}': {error}")
         return None

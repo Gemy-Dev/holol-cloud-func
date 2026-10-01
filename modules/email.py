@@ -14,6 +14,7 @@ from modules.config import (
     EMAIL_SMTP_PASSWORD,
     EMAIL_FROM_ADDRESS,
     EMAIL_FROM_NAME,
+    SMTP_TIMEOUT_S,
 )
 
 
@@ -359,6 +360,64 @@ def send_email(title, body, db):
         }), 500
 
 
+def send_pdf_email(recipients, subject, body_text, pdf_bytes, filename):
+    """Email ``pdf_bytes`` to each recipient over one SMTP connection.
+
+    Args:
+        recipients: list of ``{"email", "name"}``. A known name adds an Arabic
+            greeting; hand-picked recipients without one get the bare body.
+        filename: attachment name. Sent RFC 2231 UTF-8 encoded, so Arabic names
+            survive every mail client.
+
+    Returns:
+        ``{"sent": [emails], "failed": [{"email", "error"}]}``. One recipient
+        failing never stops the others.
+
+    Raises:
+        smtplib.SMTPException: connecting or logging in failed, so nothing was
+            sent. Callers map it to their own error response.
+    """
+    # A timeout, so a hung mail server fails this send (recorded, retryable)
+    # instead of holding the request open until the function itself times out.
+    if EMAIL_SMTP_PORT == 465:
+        server = smtplib.SMTP_SSL(EMAIL_SMTP_HOST, EMAIL_SMTP_PORT, timeout=SMTP_TIMEOUT_S)
+    else:
+        server = smtplib.SMTP(EMAIL_SMTP_HOST, EMAIL_SMTP_PORT, timeout=SMTP_TIMEOUT_S)
+        server.starttls()
+
+    sent = []
+    failed = []
+    try:
+        server.login(EMAIL_SMTP_USER, EMAIL_SMTP_PASSWORD)
+        for recipient in recipients:
+            recipient_email = recipient.get("email", "")
+            try:
+                recipient_name = recipient.get("name") or ""
+                msg = MIMEMultipart()
+                msg['From'] = f"{EMAIL_FROM_NAME} <{EMAIL_FROM_ADDRESS}>"
+                msg['To'] = recipient_email
+                msg['Subject'] = subject
+                personalized = f"مرحباً {recipient_name},\n\n{body_text}" if recipient_name else body_text
+                msg.attach(MIMEText(personalized, 'plain', 'utf-8'))
+                attachment = MIMEApplication(pdf_bytes, _subtype='pdf')
+                attachment.add_header(
+                    'Content-Disposition', 'attachment', filename=('utf-8', '', filename)
+                )
+                msg.attach(attachment)
+                server.sendmail(EMAIL_FROM_ADDRESS, recipient_email, msg.as_string())
+                sent.append(recipient_email)
+                print(f"PDF email sent to: {recipient_email}")
+            except Exception as recipient_error:
+                failed.append({"email": recipient_email, "error": str(recipient_error)})
+                print(f"Failed to send PDF email to {recipient_email}: {recipient_error}")
+    finally:
+        try:
+            server.quit()
+        except Exception:
+            pass
+    return {"sent": sent, "failed": failed}
+
+
 def send_daily_report(data, db):
     """Send daily report PDF via email to users with receiveEmailNotifications enabled.
 
@@ -477,54 +536,10 @@ def send_daily_report(data, db):
 
         # Send email via SMTP
         try:
-            if EMAIL_SMTP_PORT == 465:
-                server = smtplib.SMTP_SSL(EMAIL_SMTP_HOST, EMAIL_SMTP_PORT)
-            else:
-                server = smtplib.SMTP(EMAIL_SMTP_HOST, EMAIL_SMTP_PORT)
-                server.starttls()
-
-            server.login(EMAIL_SMTP_USER, EMAIL_SMTP_PASSWORD)
-
-            failed_recipients = []
-            successful_recipients = []
-
-            for recipient in recipients:
-                try:
-                    recipient_email = recipient["email"]
-                    recipient_name = recipient["name"]
-
-                    msg = MIMEMultipart()
-                    msg['From'] = f"{EMAIL_FROM_NAME} <{EMAIL_FROM_ADDRESS}>"
-                    msg['To'] = recipient_email
-                    msg['Subject'] = subject
-
-                    # Personalized body with recipient name (skip the greeting
-                    # when we have no name for a hand-picked recipient).
-                    if recipient_name:
-                        personalized_body = f"مرحباً {recipient_name},\n\n{body_text}"
-                    else:
-                        personalized_body = body_text
-                    msg.attach(MIMEText(personalized_body, 'plain', 'utf-8'))
-
-                    # Attach PDF
-                    pdf_attachment = MIMEApplication(pdf_bytes, _subtype='pdf')
-                    pdf_filename = f"{filename_prefix}_{user_name}_{date}.pdf"
-                    pdf_attachment.add_header(
-                        'Content-Disposition', 'attachment', filename=pdf_filename
-                    )
-                    msg.attach(pdf_attachment)
-
-                    server.sendmail(EMAIL_FROM_ADDRESS, recipient_email, msg.as_string())
-                    successful_recipients.append(recipient_email)
-                    print(f"Daily report email sent to: {recipient_name} <{recipient_email}>")
-                except Exception as recipient_error:
-                    failed_recipients.append({
-                        "email": recipient.get("email", ""),
-                        "error": str(recipient_error)
-                    })
-                    print(f"Failed to send daily report to {recipient.get('email', '')}: {str(recipient_error)}")
-
-            server.quit()
+            pdf_filename = f"{filename_prefix}_{user_name}_{date}.pdf"
+            outcome = send_pdf_email(recipients, subject, body_text, pdf_bytes, pdf_filename)
+            successful_recipients = outcome["sent"]
+            failed_recipients = outcome["failed"]
 
             if len(successful_recipients) == 0:
                 return jsonify({
@@ -795,45 +810,13 @@ def send_support_visit_report(data, db):
 
         # Send email via SMTP
         try:
-            if EMAIL_SMTP_PORT == 465:
-                server = smtplib.SMTP_SSL(EMAIL_SMTP_HOST, EMAIL_SMTP_PORT)
-            else:
-                server = smtplib.SMTP(EMAIL_SMTP_HOST, EMAIL_SMTP_PORT)
-                server.starttls()
-
-            server.login(EMAIL_SMTP_USER, EMAIL_SMTP_PASSWORD)
-
-            failed_recipients = []
-            successful_recipients = []
-
-            for recipient_email in emails:
-                try:
-                    msg = MIMEMultipart()
-                    msg['From'] = f"{EMAIL_FROM_NAME} <{EMAIL_FROM_ADDRESS}>"
-                    msg['To'] = recipient_email
-                    msg['Subject'] = subject
-
-                    msg.attach(MIMEText(body_text, 'plain', 'utf-8'))
-
-                    # Attach PDF
-                    pdf_attachment = MIMEApplication(pdf_bytes, _subtype='pdf')
-                    pdf_filename = f"support_visit_{user_name}_{date}.pdf"
-                    pdf_attachment.add_header(
-                        'Content-Disposition', 'attachment', filename=pdf_filename
-                    )
-                    msg.attach(pdf_attachment)
-
-                    server.sendmail(EMAIL_FROM_ADDRESS, recipient_email, msg.as_string())
-                    successful_recipients.append(recipient_email)
-                    print(f"Support visit report sent to: {recipient_email}")
-                except Exception as recipient_error:
-                    failed_recipients.append({
-                        "email": recipient_email,
-                        "error": str(recipient_error)
-                    })
-                    print(f"Failed to send support visit report to {recipient_email}: {str(recipient_error)}")
-
-            server.quit()
+            pdf_filename = f"support_visit_{user_name}_{date}.pdf"
+            outcome = send_pdf_email(
+                [{"email": address, "name": ""} for address in emails],
+                subject, body_text, pdf_bytes, pdf_filename,
+            )
+            successful_recipients = outcome["sent"]
+            failed_recipients = outcome["failed"]
 
             if len(successful_recipients) == 0:
                 return jsonify({

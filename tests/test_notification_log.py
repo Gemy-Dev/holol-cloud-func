@@ -329,3 +329,32 @@ class TestTodaysCount:
             for call in m.MulticastMessage.call_args_list
         }
         assert badges == {('token-a',): 2, ('token-b',): 1}
+
+
+class TestCreateOnly:
+    """Spec 2038 (research R16): once-only ids are claimed with create()."""
+
+    def _record(self, db, **kw):
+        return notification_log.record(
+            db, title='t', body='b', data={}, kind='review_request',
+            source='system', sender_id=None, recipient_ids=['u1'],
+            notification_id='review_request-report_1', **kw)
+
+    def test_first_create_only_record_is_written(self, db):
+        assert self._record(db, create_only=True) == 'review_request-report_1'
+        assert 'review_request-report_1' in db._get_all('notifications')
+
+    def test_second_create_only_record_reports_already_recorded(self, db):
+        self._record(db, create_only=True)
+        assert self._record(db, create_only=True) is notification_log.ALREADY_RECORDED
+        assert len(db._get_all('notifications')) == 1
+
+    def test_a_failed_write_is_none_not_already_recorded(self):
+        broken = MagicMock()
+        broken.collection.side_effect = RuntimeError('boom')
+        assert self._record(broken, create_only=True) is None
+
+    def test_default_record_still_overwrites(self, db):
+        self._record(db)
+        self._record(db)
+        assert len(db._get_all('notifications')) == 1

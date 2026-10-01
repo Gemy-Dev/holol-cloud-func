@@ -53,7 +53,17 @@ class _FakeDocRef:
     def id(self):
         return self._doc_id
 
-    def set(self, data: dict):
+    def set(self, data: dict, merge: bool = False):
+        if merge:
+            self.update(data)
+            return
+        self._store.setdefault(self._collection, {})[self._doc_id] = dict(data)
+
+    def create(self, data: dict):
+        """Like Firestore's create(): fails when the document exists."""
+        if self._doc_id in self._store.get(self._collection, {}):
+            from google.api_core.exceptions import AlreadyExists
+            raise AlreadyExists(f'{self._collection}/{self._doc_id} already exists')
         self._store.setdefault(self._collection, {})[self._doc_id] = dict(data)
 
     def update(self, data: dict):
@@ -68,7 +78,7 @@ class _FakeDocRef:
                 existing[key] = value
         self._store[self._collection][self._doc_id] = existing
 
-    def get(self):
+    def get(self, transaction=None):
         doc = self._store.get(self._collection, {}).get(self._doc_id)
         return _FakeDocSnapshot(self._doc_id, doc)
 
@@ -209,6 +219,42 @@ class _FakeBatch:
                 ref.delete()
 
 
+class FakeTransaction:
+    """Buffers writes and applies them in order on commit, like Firestore.
+
+    Reads go straight to the store (``ref.get(transaction=tx)``). The fake does
+    no contention detection: tests that need a race simulate both orders.
+    """
+
+    def __init__(self):
+        self.operations = []  # ('set'|'update'|'create'|'delete', ref, data, merge)
+        self.committed = False
+
+    def set(self, ref, data, merge=False):
+        self.operations.append(('set', ref, data, merge))
+
+    def update(self, ref, data):
+        self.operations.append(('update', ref, data, False))
+
+    def create(self, ref, data):
+        self.operations.append(('create', ref, data, False))
+
+    def delete(self, ref):
+        self.operations.append(('delete', ref, None, False))
+
+    def commit(self):
+        for op, ref, data, merge in self.operations:
+            if op == 'set':
+                ref.set(data, merge=merge)
+            elif op == 'update':
+                ref.update(data)
+            elif op == 'create':
+                ref.create(data)
+            elif op == 'delete':
+                ref.delete()
+        self.committed = True
+
+
 class FakeFirestore:
     """Minimal in-memory Firestore stand-in."""
 
@@ -222,6 +268,9 @@ class FakeFirestore:
 
     def batch(self) -> _FakeBatch:
         return _FakeBatch(self._store)
+
+    def transaction(self) -> FakeTransaction:
+        return FakeTransaction()
 
     # Convenience helpers for seeds
     def _put(self, collection: str, doc_id: str, data: dict):
@@ -347,3 +396,21 @@ def app_context():
 @pytest.fixture
 def db():
     return FakeFirestore()
+
+
+@pytest.fixture(autouse=True)
+def _fake_run_transaction(monkeypatch):
+    """Run ``firestore_tx.run_transaction`` against FakeFirestore.
+
+    The real helper wraps ``firestore.transactional``; the fake has no
+    contention, so ``fn`` runs once and its buffered writes are committed.
+    """
+    from modules import firestore_tx
+
+    def _run(db, fn):
+        transaction = db.transaction()
+        result = fn(transaction)
+        transaction.commit()
+        return result
+
+    monkeypatch.setattr(firestore_tx, 'run_transaction', _run)

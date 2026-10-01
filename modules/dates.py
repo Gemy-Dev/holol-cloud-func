@@ -59,6 +59,27 @@ def to_iso(value):
     return value.replace(tzinfo=None).isoformat(timespec="milliseconds")
 
 
+def as_iso(value):
+    """Any stored date — contract string, legacy Timestamp or datetime — as a
+    contract string, or None when there is nothing to convert.
+
+    Legacy documents may still hold a Firestore Timestamp (a ``datetime``), so
+    a comparison against a contract string must normalise first, or it raises
+    ``TypeError`` (research R11).
+    """
+    if value is None or value == "":
+        return None
+    if isinstance(value, str):
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return value
+        return to_iso(parsed)
+    if hasattr(value, "tzinfo"):
+        return to_iso(value)
+    return None
+
+
 def now_iso():
     """Now, in the shape the contract requires.
 

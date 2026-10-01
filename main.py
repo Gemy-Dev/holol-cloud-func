@@ -52,6 +52,12 @@ from modules.apk_manager import (
     delete_apk_version,
 )
 from modules.opportunities import get_opportunity_stats
+from modules.review_reminders import handle_report_saved, handle_review_reminders
+from modules.special_requests import (
+    handle_decide_special_request,
+    handle_edit_special_request_note,
+    handle_retry_special_request_send,
+)
 
 # Initialize Firebase Admin SDK (once)
 cred = credentials.ApplicationDefault()
@@ -113,6 +119,10 @@ def route_request(action, data, request):
     # 8 PM Iraq time - send tomorrow's tasks  
     elif action == "notify_tomorrow_tasks":
         return handle_daily_notifications(db, days_offset=1)
+
+    # 8 AM Iraq time - each reviewer's summary of pending reviews (spec 2038)
+    elif action == "review_reminders":
+        return handle_review_reminders(db)
     
     # Get all tasks stats (no auth required - for admin use)
     elif action == "getAllTasksStats":
@@ -253,6 +263,18 @@ def route_request(action, data, request):
 
     elif action == "sendSupportVisitReport":
         return send_support_visit_report(data, db)
+
+    # Client special requests (spec 2038)
+    elif action == "reportSaved":
+        return handle_report_saved(decoded_token, data, db)
+
+    elif action == "decideSpecialRequest":
+        return handle_decide_special_request(decoded_token, data, db)
+
+    elif action == "editSpecialRequestNote":
+        return handle_edit_special_request_note(decoded_token, data, db)
+    elif action == "retrySpecialRequestSend":
+        return handle_retry_special_request_send(decoded_token, data, db)
 
     # APK Management (no auth required for download)
     elif action == "getApkDownloadUrl":

@@ -35,3 +35,20 @@ EMAIL_FROM_ADDRESS = os.getenv("EMAIL_FROM_ADDRESS", "zaid.h.dev@gmail.com")  # 
 EMAIL_FROM_NAME = os.getenv("EMAIL_FROM_NAME", "holol-tibbiya")
 
 
+
+# Special client requests (spec 2038).
+SPECIAL_REQUEST_PERMISSION = "receiveSpecialRequests"
+# Gmail refuses messages over 25 MB, measured after base64 (about 4/3 of the
+# file plus line breaks): 17 MB of PDF leaves room for the encoding and the body.
+SPECIAL_REQUEST_MAX_PDF_BYTES = 17_000_000
+SPECIAL_REQUEST_IMAGE_PASSES = ((1600, 80), (1024, 60))  # (long edge px, JPEG quality)
+SPECIAL_REQUEST_STALE_CLAIM_MINUTES = 15
+ATTACHMENT_FETCH_TIMEOUT_S = 30
+# All of one PDF's downloads together; later attachments past it get their
+# placeholder page, so the send still finishes inside the function's 540 s.
+ATTACHMENT_FETCH_BUDGET_S = 180
+SMTP_TIMEOUT_S = 60
+FONTS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "fonts")
+# Reports created before this instant are not counted by the daily review
+# summary. Disabled until deploy.sh sets it to the go-live time.
+REVIEW_REMINDER_SINCE = os.getenv("REVIEW_REMINDER_SINCE", "2099-01-01T00:00:00.000")

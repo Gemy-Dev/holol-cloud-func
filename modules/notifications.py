@@ -682,6 +682,131 @@ def _unreachable_reason(user_id, user, actor_id):
     return None
 
 
+def _deliver_to_candidates(db, *, candidates, unreachable, title, body, message_data,
+                           kind, source, actor_id, notification_id=None,
+                           create_only=False):
+    """Record a notification for ``candidates`` and push to the reachable ones.
+
+    Shared by the review notification and the spec-2038 role/user sends.
+    Every addressed user is recorded, reachable or not (an unreachable phone is
+    exactly when the in-app list is the only way to find out); the actor is
+    neither recorded nor pushed. With ``create_only`` a taken ``notification_id``
+    returns ``{"skipped": "already_notified"}`` without pushing, while a failed
+    record write (``None``) still pushes.
+    """
+    tokens = []
+    token_owners = []
+    for user_id, user in candidates.items():
+        reason = _unreachable_reason(user_id, user, actor_id)
+        if reason == "actor":
+            continue
+        if reason:
+            unreachable.append({"userId": user_id, "reason": reason})
+            continue
+        # One device signed in to two of the recipients still alerts once.
+        if user["fcmToken"] in tokens:
+            continue
+        tokens.append(user["fcmToken"])
+        token_owners.append(user_id)
+
+    for entry in unreachable:
+        print(f"📭 Recipient {entry['userId']} unreachable: {entry['reason']}")
+
+    message_data = dict(message_data or {})
+    recorded_id = notification_log.record(
+        db,
+        title=title,
+        body=body,
+        data=message_data,
+        kind=kind,
+        source=source,
+        sender_id=actor_id,
+        recipient_ids=[user_id for user_id in candidates if user_id != actor_id],
+        notification_id=notification_id,
+        create_only=create_only,
+    )
+    if recorded_id is notification_log.ALREADY_RECORDED:
+        return {"skipped": "already_notified"}
+
+    if not tokens:
+        notification_log.record_delivery(db, recorded_id, success_count=0, failure_count=0)
+        return {
+            "successCount": 0, "failureCount": 0, "totalTokens": 0,
+            "prunedTokens": 0, "unreachable": unreachable,
+            "notificationId": recorded_id,
+        }
+
+    if recorded_id:
+        message_data["notificationId"] = recorded_id
+    badges = notification_log.todays_counts(db, token_owners)
+    try:
+        success_count, failure_count, pruned = _send_multicast(
+            db, tokens, token_owners, title, body, message_data, badges
+        )
+        reason = None
+    except Exception as error:
+        # The notice is already recorded (and, with create_only, claimed), so a
+        # retry would find it taken and never push. Report the failed push on
+        # the record instead of raising: the in-app list still shows it.
+        print(f"⚠️ Push failed for {recorded_id}: {error}")
+        success_count, failure_count, pruned = 0, len(tokens), 0
+        reason = "send_error"
+    notification_log.record_delivery(
+        db, recorded_id, success_count=success_count, failure_count=failure_count,
+        reason=reason,
+    )
+    return {
+        "successCount": success_count, "failureCount": failure_count,
+        "totalTokens": len(tokens), "prunedTokens": pruned,
+        "unreachable": unreachable, "notificationId": recorded_id,
+    }
+
+
+def send_to_roles(db, *, roles, title, body, message_data, kind, source, actor_id,
+                  notification_id=None, create_only=False, extra_user_ids=()):
+    """Notify every holder of ``roles`` (plus ``extra_user_ids``), minus the actor.
+
+    ``roles`` are the keys of ``_ROLE_SPELLINGS`` (``admin``, ``salesManager``).
+    """
+    users = db.collection("users")
+    candidates = {}
+    unreachable = []
+    for user_id in extra_user_ids:
+        snapshot = users.document(user_id).get()
+        if snapshot.exists:
+            candidates[user_id] = snapshot.to_dict() or {}
+        else:
+            unreachable.append({"userId": user_id, "reason": "not_found"})
+
+    spellings = [spelling for role in roles for spelling in _ROLE_SPELLINGS[role]]
+    # A single-field `in` filter needs no composite index (9 values < 30).
+    for user_doc in users.where("role", "in", spellings).stream():
+        candidates.setdefault(user_doc.id, user_doc.to_dict() or {})
+
+    return _deliver_to_candidates(
+        db, candidates=candidates, unreachable=unreachable, title=title, body=body,
+        message_data=message_data, kind=kind, source=source, actor_id=actor_id,
+        notification_id=notification_id, create_only=create_only,
+    )
+
+
+def send_to_user(db, *, user_id, title, body, message_data, kind, source, actor_id,
+                 notification_id=None, create_only=False):
+    """Notify one user; recorded even when their push is off or unregistered."""
+    snapshot = db.collection("users").document(user_id).get()
+    if not snapshot.exists:
+        return {
+            "successCount": 0, "failureCount": 0, "totalTokens": 0, "prunedTokens": 0,
+            "unreachable": [{"userId": user_id, "reason": "not_found"}],
+            "notificationId": None,
+        }
+    return _deliver_to_candidates(
+        db, candidates={user_id: snapshot.to_dict() or {}}, unreachable=[], title=title,
+        body=body, message_data=message_data, kind=kind, source=source,
+        actor_id=actor_id, notification_id=notification_id, create_only=create_only,
+    )
+
+
 def handle_send_review_notification(decoded_token, data, db):
     """Notify the representative and the other manager role about a review.
 
@@ -714,88 +839,26 @@ def handle_send_review_notification(decoded_token, data, db):
         # exclude or impersonate someone else as the reviewer.
         reviewer_id = decoded_token.get("uid")
         representative_id = data.get("representativeId")
-        users = db.collection("users")
-
-        candidates = {}
-        unreachable = []
-        if representative_id:
-            snapshot = users.document(representative_id).get()
-            if snapshot.exists:
-                candidates[representative_id] = snapshot.to_dict() or {}
-            else:
-                unreachable.append({"userId": representative_id, "reason": "not_found"})
-
-        # A single-field `in` filter needs no composite index.
-        role_holders = users.where("role", "in", _ROLE_SPELLINGS[other_role])
-        for user_doc in role_holders.stream():
-            candidates.setdefault(user_doc.id, user_doc.to_dict() or {})
-
-        tokens = []
-        token_owners = []
-        for user_id, user in candidates.items():
-            reason = _unreachable_reason(user_id, user, reviewer_id)
-            if reason == "actor":
-                continue
-            if reason:
-                unreachable.append({"userId": user_id, "reason": reason})
-                continue
-            # One device signed in to two of the recipients still alerts once.
-            if user["fcmToken"] in tokens:
-                continue
-            tokens.append(user["fcmToken"])
-            token_owners.append(user_id)
-
-        for entry in unreachable:
-            print(f"📭 Review recipient {entry['userId']} unreachable: {entry['reason']}")
-
-        # Every named recipient is stored, reachable or not: an unreachable
-        # phone is exactly when the in-app list is the only way to find out.
-        message_data = _message_data(data.get("notificationAction"))
-        notification_id = notification_log.record(
+        result = send_to_roles(
             db,
+            roles=[other_role],
             title=title,
             body=body,
-            data=message_data,
+            message_data=_message_data(data.get("notificationAction")),
             kind="review",
             source=notification_log.request_source(data),
-            sender_id=reviewer_id,
-            recipient_ids=[user_id for user_id in candidates if user_id != reviewer_id],
+            actor_id=reviewer_id,
+            extra_user_ids=[representative_id] if representative_id else [],
         )
-
-        if not tokens:
-            notification_log.record_delivery(db, notification_id, success_count=0, failure_count=0)
-            return jsonify({
-                "success": True,
-                "message": "Notification sent to 0 users",
-                "successCount": 0,
-                "failureCount": 0,
-                "totalTokens": 0,
-                "prunedTokens": 0,
-                "unreachable": unreachable
-            }), 200
-
-        if notification_id:
-            message_data["notificationId"] = notification_id
-        badges = notification_log.todays_counts(db, token_owners)
-        success_count, failure_count, pruned = _send_multicast(
-            db, tokens, token_owners, title, body, message_data, badges
-        )
-        notification_log.record_delivery(
-            db, notification_id, success_count=success_count, failure_count=failure_count
-        )
+        result.pop("notificationId", None)
         print(
-            f"✅ Review notification sent to {success_count} users, "
-            f"{failure_count} failed"
+            f"✅ Review notification sent to {result['successCount']} users, "
+            f"{result['failureCount']} failed"
         )
-
         return jsonify({
             "success": True,
-            "message": f"Notification sent to {success_count} users",
-            "successCount": success_count,
-            "failureCount": failure_count,
-            "totalTokens": len(tokens),
-            "prunedTokens": pruned,
-            "unreachable": unreachable
+            "message": f"Notification sent to {result['successCount']} users",
+            **result,
         }), 200
 
     except Exception as e:

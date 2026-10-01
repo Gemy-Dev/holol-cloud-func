@@ -25,6 +25,14 @@ PROJECT_ID="test-medical-80e1b"
 REGION="us-central1"
 BACKUP_BUCKET="${PROJECT_ID}-firestore-backups"
 
+# The moment the reviewers' morning summary starts counting (spec 2038): reports
+# and visits created before it are never reminded about. The default is far in the
+# future, which keeps the summary silent. Set the go-live time (Iraq time, the
+# contract's date format) here or in the environment BEFORE deploying: every deploy
+# replaces ALL env vars with the list below, so a value left out resets to the
+# silent default.
+REVIEW_REMINDER_SINCE="${REVIEW_REMINDER_SINCE:-2099-01-01T00:00:00.000}"
+
 echo "🔧 Setting project configuration..."
 gcloud config set project $PROJECT_ID
 
@@ -118,7 +126,7 @@ deploy_main_function() {
         --allow-unauthenticated \
         --memory=1Gi \
         --timeout=540s \
-        --set-env-vars="GOOGLE_CLOUD_PROJECT=$PROJECT_ID,ALLOWED_ORIGINS=*,EMAIL_SMTP_PASSWORD=dvgtizshxpxxefxn" \
+        --set-env-vars="GOOGLE_CLOUD_PROJECT=$PROJECT_ID,ALLOWED_ORIGINS=*,EMAIL_SMTP_PASSWORD=dvgtizshxpxxefxn,REVIEW_REMINDER_SINCE=$REVIEW_REMINDER_SINCE" \
         --max-instances=10 \
         --min-instances=0
     
@@ -157,9 +165,9 @@ setup_schedulers() {
     echo "🔗 App Function URL: $FUNCTION_URL"
     
     # Task notifications: once a day at 05:00 UTC = 08:00 Iraq time, matching
-    # handle_daily_notifications' documented intent. Do NOT shorten this —
-    # the handler has no "already notified" guard, so every run re-pushes to
-    # every user with tasks due that day.
+    # handle_daily_notifications' documented intent. The handler skips a
+    # reminder already recorded under its id, so a repeated run does not push
+    # twice; the schedule still stays once a day.
     #
     # The Content-Type header is load-bearing: without it gcloud sends
     # Content-Type: application/octet-stream, and main.py's request.get_json()
@@ -196,7 +204,7 @@ setup_schedulers() {
     
     # Tomorrow's tasks: 17:00 UTC = 20:00 Iraq time, the second half of
     # handle_daily_notifications' documented schedule (days_offset=1).
-    # Same no-dedupe caveat as above — this must stay once a day.
+    # Same guard as above, and the same once-a-day schedule.
     if gcloud scheduler jobs describe notify-tomorrow-tasks --location=$REGION --project=$PROJECT_ID &>/dev/null; then
         echo "📝 Updating tomorrow-tasks scheduler..."
         gcloud scheduler jobs update http notify-tomorrow-tasks \
@@ -222,6 +230,35 @@ setup_schedulers() {
             --project=$PROJECT_ID
     fi
     
+    # Reviewers' summary of pending reviews and undecided special requests
+    # (spec 2038): 05:00 UTC = 08:00 Iraq time. Each reviewer's summary is
+    # claimed under a per-day id, so a repeated run sends nothing. Same
+    # Content-Type and create/update header rules as above.
+    if gcloud scheduler jobs describe review-reminders --location=$REGION --project=$PROJECT_ID &>/dev/null; then
+        echo "📝 Updating review reminders scheduler..."
+        gcloud scheduler jobs update http review-reminders \
+            --schedule="0 5 * * *" \
+            --uri="$FUNCTION_URL" \
+            --http-method=POST \
+            --update-headers="Content-Type=application/json" \
+            --message-body='{"action":"review_reminders"}' \
+            --time-zone="UTC" \
+            --location=$REGION \
+            --project=$PROJECT_ID
+    else
+        echo "🆕 Creating review reminders scheduler..."
+        gcloud scheduler jobs create http review-reminders \
+            --schedule="0 5 * * *" \
+            --uri="$FUNCTION_URL" \
+            --http-method=POST \
+            --headers="Content-Type=application/json" \
+            --message-body='{"action":"review_reminders"}' \
+            --time-zone="UTC" \
+            --location=$REGION \
+            --description="Pending review summary daily at 08:00 Iraq time" \
+            --project=$PROJECT_ID
+    fi
+
     return $?
 }
 
