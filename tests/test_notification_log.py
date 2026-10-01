@@ -288,10 +288,10 @@ class TestApkUpdate:
 
 
 class TestTodaysCount:
-    def _seed(self, db, doc_id, recipients, sender='someone', days_ago=0):
+    def _seed(self, db, doc_id, recipients, sender='someone', days_ago=0, important=True):
         db._put('notifications', doc_id, {
             'id': doc_id, 'recipientIds': recipients, 'senderId': sender,
-            'createdAt': _iso(days_ago),
+            'createdAt': _iso(days_ago), 'important': important,
         })
 
     def test_counts_what_the_user_sees_today(self, db):
@@ -303,10 +303,28 @@ class TestTodaysCount:
 
         assert notification_log.todays_counts(db, ['rep']) == {'rep': 2}
 
+    def test_only_important_ones_count(self, db):
+        self._seed(db, 'completed', ['all'])
+        self._seed(db, 'date-changed', ['all'], important=False)
+
+        assert notification_log.todays_counts(db, ['rep']) == {'rep': 1}
+
+    def test_records_from_before_the_flag_are_classified_on_read(self, db):
+        db._put('notifications', 'legacy-review', {
+            'recipientIds': ['rep'], 'kind': 'review', 'createdAt': _iso(),
+        })
+        db._put('notifications', 'legacy-date', {
+            'recipientIds': ['all'], 'kind': 'broadcast', 'source': 'app',
+            'title': 'تغيير تاريخ مهمة', 'createdAt': _iso(),
+        })
+
+        assert notification_log.todays_counts(db, ['rep']) == {'rep': 1}
+
     def test_the_badge_is_sent_with_the_push(self, db):
         self._seed(db, 'earlier', ['all'])
         db._put('users', 'rep', _user('token-rep'))
-        data = {'title': 't', 'body': 'b'}
+        data = {'title': 'إنجاز مهمة', 'body': 'b',
+                'notificationAction': {'action': 'open_task', 'event': 'task_completed'}}
 
         with patch('modules.notifications.messaging', _patched_messaging()) as m:
             handle_send_notification_to_all({'uid': 'manager'}, data, db)
@@ -315,11 +333,21 @@ class TestTodaysCount:
         assert kwargs['apns'].payload.aps.badge == 2, 'the earlier one and this one'
         assert kwargs['android'].notification.notification_count == 2
 
+    def test_a_push_only_notification_leaves_the_count_alone(self, db):
+        self._seed(db, 'earlier', ['all'])
+        db._put('users', 'rep', _user('token-rep'))
+        data = {'title': 'تغيير تاريخ مهمة', 'body': 'b'}
+
+        with patch('modules.notifications.messaging', _patched_messaging()) as m:
+            handle_send_notification_to_all({'uid': 'manager'}, data, db)
+
+        assert m.MulticastMessage.call_args.kwargs['apns'].payload.aps.badge == 1
+
     def test_recipients_with_different_counts_get_their_own_badge(self, db):
         self._seed(db, 'only-for-a', ['rep-a'])
         db._put('users', 'rep-a', _user('token-a'))
         db._put('users', 'rep-b', _user('token-b'))
-        data = {'title': 't', 'body': 'b'}
+        data = {'title': 't', 'body': 'b', 'notificationAction': {'event': 'activity_added'}}
 
         with patch('modules.notifications.messaging', _patched_messaging()) as m:
             handle_send_notification_to_all({'uid': 'manager'}, data, db)
@@ -329,6 +357,46 @@ class TestTodaysCount:
             for call in m.MulticastMessage.call_args_list
         }
         assert badges == {('token-a',): 2, ('token-b',): 1}
+
+
+class TestImportance:
+    """Spec 2039: only the events someone has to act on are listed."""
+
+    def _record(self, db, *, title='t', kind='broadcast', data=None, source='app'):
+        notification_id = notification_log.record(
+            db, title=title, body='b', data=data or {}, kind=kind, source=source,
+            sender_id=None, recipient_ids=['all'])
+        return db._get_all('notifications')[notification_id]
+
+    def test_a_named_important_event_is_listed(self, db):
+        record = self._record(db, data={'action': 'open_task', 'event': 'task_completed'})
+
+        assert record['event'] == 'task_completed'
+        assert record['important'] is True
+
+    def test_a_named_push_only_event_is_not(self, db):
+        record = self._record(db, data={'event': 'task_date_changed'})
+
+        assert record['event'] == 'task_date_changed'
+        assert record['important'] is False
+
+    def test_every_review_is_listed(self, db):
+        assert self._record(db, kind='review', source='dashboard')['important'] is True
+
+    def test_older_app_builds_are_recognised_by_title(self, db):
+        for title in ('إنجاز مهمة', 'إضافة نشاط', 'إضافة سجل دعم فني جديد',
+                      '🔔 Add: Visit Technical Support', '🔔 Add: Main Opportunity',
+                      'تمت مراجعة التقرير'):
+            assert self._record(db, title=title)['important'] is True, title
+
+    def test_unnamed_sends_are_push_only(self, db):
+        for title in ('تغيير تاريخ مهمة', 'حذف مهمة', 'تذكير بالمهام'):
+            assert self._record(db, title=title)['important'] is False, title
+
+    def test_a_dashboard_title_alone_does_not_make_it_important(self, db):
+        # An admin's free-text message titled like an event is still a message.
+        assert self._record(db, title='إنجاز مهمة', kind='direct',
+                            source='dashboard')['important'] is False
 
 
 class TestCreateOnly:
