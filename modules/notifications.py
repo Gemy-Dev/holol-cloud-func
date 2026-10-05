@@ -138,138 +138,20 @@ def _normalize_target_date(value):
 
 
 def handle_daily_notifications(db, days_offset=0):
-    """Remind each representative of their own tasks for a specific date.
-    
-    Args:
-        db: Firestore database instance
-        days_offset: Days from today (0=today, 1=tomorrow, etc.)
-    
-    Used by Cloud Scheduler:
-    - 8 AM Iraq time (UTC+3): days_offset=0 (today's tasks)
-    - 8 PM Iraq time (UTC+3): days_offset=1 (tomorrow's tasks)
-    """
-    try:
-        # Calculate target date in Iraq time (UTC+3)
-        iraq_now = datetime.now(IRAQ_TIMEZONE)
-        target_date = (iraq_now.date() + timedelta(days=days_offset)).isoformat()
-        
-        print(f"🔔 Running task notifications for date: {target_date} (offset: {days_offset})")
+    """Compatibility route; shares claims with the hourly role scheduler."""
+    from modules.role_reminders import handle_role_reminders
+    response, status = handle_role_reminders(db, daily_offset=days_offset)
+    payload = response.get_json()
+    payload['count'] = payload['pushCount']
+    payload['offset'] = days_offset
+    return jsonify(payload), status
 
-        # Read the day's tasks once, grouped by assignee. This used to re-read
-        # every task for every user and tell each of them about every task due
-        # that day, whoever it belonged to — which the stored notification
-        # list would now have shown to everyone.
-        tasks_by_user = {}
-        for task_doc in db.collection("tasks").stream():
-            task = task_doc.to_dict() or {}
-            if task.get("reviewState") == "deleted":
-                continue
-            assignee = task.get("assignedToId")
-            if not assignee:
-                continue
-            if _normalize_target_date(task.get("targetDate")) != target_date:
-                continue
-            tasks_by_user.setdefault(assignee, []).append({
-                "id": task_doc.id,
-                "title": task.get("title", "بدون عنوان")
-            })
 
-        # Record every reminder before sending any, so the badge counts below
-        # include the reminder each device is about to receive.
-        reminders = []
-        for user_id, user_tasks in tasks_by_user.items():
-            user_snapshot = db.collection("users").document(user_id).get()
-            if not user_snapshot.exists:
-                continue
-
-            # A fixed id per user, date and run: the scheduler has held two
-            # jobs for the same 05:00 run, and a second run must not remind
-            # anyone twice.
-            reminder_id = f"daily_tasks-{target_date}-{days_offset}-{user_id}"
-            if db.collection(notification_log.COLLECTION).document(reminder_id).get().exists:
-                continue
-
-            task_count = len(user_tasks)
-            task_ids = [task["id"] for task in user_tasks]
-            
-            # Create notification body based on offset
-            if days_offset == 0:
-                # Today's tasks
-                if task_count == 1:
-                    body = f"عندك اليوم مهمة: {user_tasks[0]['title']}"
-                else:
-                    body = f"عندك اليوم {task_count} مهام"
-            else:
-                # Tomorrow's tasks
-                if task_count == 1:
-                    body = f"عندك غدا مهمة: {user_tasks[0]['title']}"
-                else:
-                    body = f"عندك غدا {task_count} مهام"
-
-            message_data = {
-                "taskCount": str(task_count),
-                "taskIds": ",".join(task_ids),
-                "date": target_date,
-                "action": "daily_tasks"
-            }
-            notification_id = notification_log.record(
-                db,
-                title="تذكير بالمهام",
-                body=body,
-                data=message_data,
-                kind="daily_tasks",
-                source="system",
-                sender_id=None,
-                recipient_ids=[user_id],
-                notification_id=reminder_id,
-            )
-            reminders.append((user_id, (user_snapshot.to_dict() or {}).get("fcmToken"),
-                              body, message_data, notification_id))
-
-        badges = notification_log.todays_counts(db, [reminder[0] for reminder in reminders])
-        notification_count = 0
-
-        for user_id, fcm_token, body, message_data, notification_id in reminders:
-            if not fcm_token:
-                notification_log.record_delivery(
-                    db, notification_id, success_count=0, failure_count=0,
-                    reason="no_valid_registration"
-                )
-                continue
-
-            if notification_id:
-                message_data = {**message_data, "notificationId": notification_id}
-            message = messaging.Message(
-                token=fcm_token,
-                notification=messaging.Notification(
-                    title="تذكير بالمهام",
-                    body=body
-                ),
-                data=message_data,
-                **notification_log.badge_config(badges.get(user_id))
-            )
-            try:
-                messaging.send(message)
-                notification_count += 1
-                notification_log.record_delivery(db, notification_id, success_count=1, failure_count=0)
-                print(f"✅ Sent to {user_id}: {message_data['taskCount']} tasks")
-            except Exception as e:
-                notification_log.record_delivery(db, notification_id, success_count=0, failure_count=1)
-                print(f"❌ Error sending to {user_id}: {str(e)}")
-        
-        return jsonify({
-            "success": True, 
-            "message": f"Task notifications completed. Sent {notification_count} notifications.",
-            "date": target_date,
-            "offset": days_offset,
-            "count": notification_count
-        })
-        
-    except Exception as e:
-        error_msg = f"Error in task notifications: {str(e)}"
-        print(error_msg)
-        print(traceback.format_exc())
-        return jsonify({"error": error_msg        }), 500
+def _disabled_business_route(message_data):
+    return message_data.get('action') in {
+        'open_client', 'open_clients', 'open_deal', 'open_deals',
+        'open_plan', 'open_plans', 'open_material_transfer', 'open_material_transfers',
+    }
 
 
 def handle_send_notification(decoded_token, data, db):
@@ -309,6 +191,8 @@ def handle_send_notification(decoded_token, data, db):
             target_user_id = _token_owner(db, fcm_token)
 
         message_data = _message_data(notification_action)
+        if _disabled_business_route(message_data):
+            return jsonify({'success': True, 'skipped': 'event_disabled'}), 200
         notification_id = notification_log.record(
             db,
             title=title,
@@ -536,7 +420,20 @@ def handle_send_notification_to_all(decoded_token, data, db):
         sender_id = decoded_token.get("uid")
         
         message_data = _message_data(notification_action)
-        
+        from modules import business_notifications
+        event = notification_log.classify(title=title, kind='broadcast',
+                                         data=message_data,
+                                         source=notification_log.request_source(data))
+        if event in business_notifications.EVENTS:
+            return business_notifications.handle_business_notification(
+                decoded_token, {**data, 'event': event, 'notificationAction': message_data}, db
+            )
+        if ((event and event.startswith('task_date_'))
+                or message_data.get('entityType') in ('task', 'appointment', 'opportunity')
+                or message_data.get('action') in ('open_support_record', 'open_main_opportunity')
+                or _disabled_business_route(message_data)):
+            return jsonify({'success': True, 'skipped': 'event_disabled'}), 200
+
         # The audience, per data-model.md §2. The preference and the active
         # flag are a composite Firestore query; excluding the sender and
         # tokenless users is done here because Firestore cannot express
@@ -694,6 +591,8 @@ def _deliver_to_candidates(db, *, candidates, unreachable, title, body, message_
     returns ``{"skipped": "already_notified"}`` without pushing, while a failed
     record write (``None``) still pushes.
     """
+    if kind == 'special_request':
+        return {'skipped': 'event_disabled'}
     tokens = []
     token_owners = []
     for user_id, user in candidates.items():
@@ -729,7 +628,11 @@ def _deliver_to_candidates(db, *, candidates, unreachable, title, body, message_
         return {"skipped": "already_notified"}
 
     if not tokens:
-        notification_log.record_delivery(db, recorded_id, success_count=0, failure_count=0)
+        reasons = {entry['reason'] for entry in unreachable}
+        notification_log.record_delivery(
+            db, recorded_id, success_count=0, failure_count=0,
+            reason=next(iter(reasons)) if len(reasons) == 1 else None,
+        )
         return {
             "successCount": 0, "failureCount": 0, "totalTokens": 0,
             "prunedTokens": 0, "unreachable": unreachable,
@@ -838,6 +741,16 @@ def handle_send_review_notification(decoded_token, data, db):
         # Taken from the verified token, not the payload, so a caller cannot
         # exclude or impersonate someone else as the reviewer.
         reviewer_id = decoded_token.get("uid")
+        reviewer_snapshot = db.collection('users').document(reviewer_id).get()
+        if reviewer_snapshot.exists:
+            from modules.business_notifications import role_of
+            reviewer = reviewer_snapshot.to_dict() or {}
+            actor_role = role_of(reviewer)
+            other_role = _OTHER_REVIEWER_ROLE.get(actor_role)
+            if other_role is None or reviewer.get('isActive') is False:
+                return jsonify({'success': False, 'error': 'not_a_reviewer'}), 403
+            title = ('مسؤول النظام عمل مراجعة' if actor_role == 'admin'
+                     else 'مدير المبيعات عمل مراجعة')
         representative_id = data.get("representativeId")
         result = send_to_roles(
             db,

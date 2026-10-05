@@ -22,7 +22,7 @@ def _seed_report(db, rid='r1', **kw):
 
 
 def _seed_visit(db, sid='s1', vid='v1', **visit):
-    entry = {'id': vid, 'technicianId': 'tech', 'technicianName': 'الفني',
+    entry = {'status': 'completed', 'id': vid, 'technicianId': 'tech', 'technicianName': 'الفني',
              'visitDate': '2026-10-01T08:00:00.000', 'createdAt': '2026-10-01T08:00:00.000',
              'hasSpecialRequests': True, 'clientOrders': 'طلب'}
     entry.update(visit)
@@ -263,7 +263,9 @@ def _announce(db, payload=None, uid=REP):
 
 
 def _notification(db, rid='report_r1'):
-    return db._get_all('notifications').get(f'review_request-{rid}')
+    if rid.startswith('visit_'):
+        return db._get_all('notifications').get('support_visit_added-' + rid[6:].replace('_', '-'))
+    return db._get_all('notifications').get('task_completed-report-' + rid[7:])
 
 
 def test_a_new_report_notifies_the_sales_managers_and_admins_once(db):
@@ -272,8 +274,8 @@ def test_a_new_report_notifies_the_sales_managers_and_admins_once(db):
     body, status, pushed = _announce(db)
     assert status == 200 and body['notified'] is True
     notice = _notification(db)
-    assert notice['kind'] == 'review_request'
-    assert notice['title'] == 'وصل تقرير جديد بحاجة إلى مراجعة'
+    assert notice['kind'] == 'business_event'
+    assert notice['title'] == 'المندوب أنجز مهمة'
     assert sorted(notice['recipientIds']) == ['adm', 'mgr', 'mgr_off']
     # Pushed to the two reachable reviewers only; the unreachable one is on record.
     assert sorted(pushed[0]['tokens']) == ['adm-token', 'mgr-token']
@@ -291,7 +293,7 @@ def test_the_actor_is_not_told_about_their_own_save(db):
     _reviewers(db)
     _seed_report(db)
     _announce(db, uid='adm')
-    assert 'adm' not in _notification(db)['recipientIds']
+    assert _notification(db) is None  # an admin's report is not a rep completion
 
 
 def test_a_second_created_is_already_notified_and_pushes_nothing(db):
@@ -301,7 +303,7 @@ def test_a_second_created_is_already_notified_and_pushes_nothing(db):
     body, status, pushed = _announce(db)
     assert status == 200 and body['notified'] is False and body['reason'] == 'already_notified'
     assert pushed == []
-    assert len([k for k in db._get_all('notifications') if k.startswith('review_request-')]) == 1
+    assert len([k for k in db._get_all('notifications') if k.startswith('task_completed-report-')]) == 1
 
 
 def test_an_updated_event_never_announces(db):
@@ -395,15 +397,16 @@ def test_tapping_the_notice_opens_the_source(db):
     _announce(db)
     _announce(db, {'sourceType': 'visit', 'supportRecordId': 's1', 'visitId': 'v9',
                    'expectedFlag': True, 'expectedText': 'طلب'}, uid='tech')
-    assert _notification(db)['data'] == {'action': 'open_daily_report', 'reportId': 'r1'}
+    assert _notification(db)['data'] == {'action': 'open_daily_report', 'reportId': 'r1', 'event': 'task_completed'}
     assert _notification(db, 'visit_s1_v9')['data'] == {
-        'action': 'open_support_record', 'supportRecordId': 's1'}
+        'action': 'open_support_record', 'supportRecordId': 's1',
+        'visitId': 'v9', 'event': 'support_visit_added'}
 
 
 def test_an_announcement_failure_is_a_retryable_error_not_a_lost_notice(db):
     _reviewers(db)
     _seed_report(db)
-    with patch('modules.review_reminders.notifications.send_to_roles', side_effect=RuntimeError('down')):
+    with patch('modules.business_notifications.deliver_event', side_effect=RuntimeError('down')):
         body, status = _call(db, {})
     assert status == 500
     # The record refresh still happened, and a retry announces.

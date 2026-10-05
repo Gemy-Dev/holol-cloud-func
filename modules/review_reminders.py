@@ -69,6 +69,22 @@ def _announce(db, source, record, caller_uid, caller_source="system"):
     The caller (the rep, or an admin on the dashboard) is not told about their
     own save.
     """
+    from modules import business_notifications as business
+    task_id = source.raw.get('taskId') if source.source_type == 'report' else None
+    if task_id or source.source_type == 'visit':
+        route = ({'action': 'open_task', 'taskId': task_id} if task_id else
+                 {'action': 'open_support_record', 'supportRecordId': source.support_record_id,
+                  'visitId': source.visit_id})
+        result = business.deliver_event(
+            db, actor_id=caller_uid,
+            event='task_completed' if task_id else 'support_visit_added', route=route,
+            title='إنجاز مهمة' if task_id else 'إنجاز مهمة دعم فني',
+            body=f"العميل: {source.client_name or '-'}\nبواسطة: {source.rep_name or '-'}\nالنوع: {sr.type_label(source)}",
+            source=caller_source,
+        )
+        if result is None:
+            raise sr.SpecialRequestError('source_not_synced', 409)
+        return result
     lines = [
         f"المندوب: {source.rep_name or '-'}",
         f"العميل: {source.client_name or '-'}",
@@ -80,18 +96,14 @@ def _announce(db, source, record, caller_uid, caller_source="system"):
         route = {"action": "open_daily_report", "reportId": source.report_id}
     else:
         route = {"action": "open_support_record", "supportRecordId": source.support_record_id}
-    return notifications.send_to_roles(
-        db,
-        roles=["salesManager", "admin"],
-        title="وصل تقرير جديد بحاجة إلى مراجعة",
-        body="\n".join(lines),
-        message_data=route,
-        kind="review_request",
-        source=caller_source,
-        actor_id=caller_uid,
-        notification_id=f"review_request-{source.request_id}",
-        create_only=True,
+    result = business.deliver_event(
+        db, actor_id=caller_uid, event='task_completed', route=route,
+        title='إنجاز مهمة', body='\n'.join(lines), source=caller_source,
     )
+    if result is None:
+        raise sr.SpecialRequestError('source_not_synced', 409)
+    return result
+
 
 
 def handle_report_saved(decoded_token, data, db):

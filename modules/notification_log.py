@@ -19,11 +19,15 @@ Document shape, ``notifications/{id}``:
     audience      "all" or "users"
     recipientIds  ["all"] for a broadcast, else the addressed uids
     createdAt     contract ISO string (R1), Iraq time
+    event         what happened (``IMPORTANT_EVENTS``), or None
+    important     whether the app lists it — see ``classify``
     delivery      {successCount, failureCount[, reason]} once the send returns
 
-There is deliberately no read state. A person sees a notification when it is
-addressed to them, or when it is a broadcast somebody else sent — the rule
-``is_visible_to`` spells out, and the field app applies to its list.
+Read state is kept on each phone, never here. A person sees a notification
+when it is addressed to them, or when it is a broadcast somebody else sent —
+the rule ``is_visible_to`` spells out, and the field app applies to its list.
+Only important ones are listed and counted on the badge; the rest are a push
+and nothing more.
 """
 
 from datetime import datetime
@@ -40,6 +44,63 @@ COLLECTION = "notifications"
 # `recipientIds array-contains-any [uid, "all"]`, so a broadcast and a
 # notification addressed to the viewer come back from one query.
 ALL = "all"
+
+# The events the app's notification page lists. Everything else — date
+# changes, deletions, edits, reminders — is pushed but not listed, so the
+# page holds only what someone has to act on.
+IMPORTANT_EVENTS = frozenset({
+    "pending_review", "daily_tasks", "weekly_schedule", "kpi_review",
+    "opportunity_action", "missed_task", "support_due", "support_overdue",
+    "support_activity_assigned",
+    "task_completed",
+    "activity_added",
+    "opportunity_added",
+    "review",
+    "support_record_added",
+    "support_visit_added",
+})
+
+# App builds released before senders named their event, told apart by the
+# exact title each one sends. Matched only for the field app: the dashboard is
+# always the latest build, and an admin's free-text title must not pass for
+# one of these.
+_LEGACY_APP_TITLES = {
+    "إنجاز مهمة": "task_completed",
+    "إضافة نشاط": "activity_added",
+    "تمت مراجعة التقرير": "review",
+    "إضافة سجل دعم فني جديد": "support_record_added",
+    "🔔 Add: Visit Technical Support": "support_visit_added",
+    "🔔 Add: Main Opportunity": "opportunity_added",
+}
+
+
+def classify(*, title, kind, data, source):
+    """The event a notification announces, or None when it names none."""
+    event = (data or {}).get("event")
+    if event:
+        return str(event)
+    if kind == "review":
+        return "review"
+    if source == "app":
+        return _LEGACY_APP_TITLES.get(title)
+    return None
+
+
+def is_important(notification):
+    """Whether a stored notification is listed and counted.
+
+    Records written before ``important`` was stored are classified the way
+    they would be now.
+    """
+    if "important" in notification:
+        return notification["important"] is True
+    event = classify(
+        title=notification.get("title"),
+        kind=notification.get("kind"),
+        data=notification.get("data"),
+        source=notification.get("source"),
+    )
+    return event in IMPORTANT_EVENTS
 
 
 def request_source(data):
@@ -92,6 +153,7 @@ def record(db, *, title, body, data, kind, source, sender_id, recipient_ids,
     try:
         collection = db.collection(COLLECTION)
         ref = collection.document(notification_id) if notification_id else collection.document()
+        event = classify(title=title, kind=kind, data=data, source=source)
         payload = {
             "id": ref.id,
             "title": title,
@@ -104,6 +166,8 @@ def record(db, *, title, body, data, kind, source, sender_id, recipient_ids,
             "audience": "all" if ALL in recipient_ids else "users",
             "recipientIds": list(recipient_ids),
             "createdAt": now_iso(),
+            "event": event,
+            "important": event in IMPORTANT_EVENTS,
         }
         if create_only:
             ref.create(payload)
@@ -140,7 +204,8 @@ def is_visible_to(notification, user_id):
     recipients = notification.get("recipientIds") or []
     if user_id in recipients:
         return True
-    return ALL in recipients and notification.get("senderId") != user_id
+    return (not is_important(notification) and ALL in recipients
+            and notification.get("senderId") != user_id)
 
 
 def today_start_iso():
@@ -151,12 +216,13 @@ def today_start_iso():
 
 
 def todays_counts(db, user_ids):
-    """How many of today's notifications each of ``user_ids`` sees.
+    """How many of today's important notifications each of ``user_ids`` sees.
 
-    This is the number on the app icon: today's notifications, not unread
-    ones — there is no read state. One read of today's records serves every
-    recipient. On failure returns ``{}``, so the send carries no badge and the
-    icon keeps its last value rather than showing a wrong one.
+    The number on the app icon while the app is closed. The app lowers it to
+    the unread ones when it opens: which were opened is known only on the
+    phone. One read of today's records serves every recipient. On failure
+    returns ``{}``, so the send carries no badge and the icon keeps its last
+    value rather than showing a wrong one.
     """
     counts = {user_id: 0 for user_id in user_ids if user_id}
     if not counts:
@@ -165,6 +231,8 @@ def todays_counts(db, user_ids):
         todays = db.collection(COLLECTION).where("createdAt", ">=", today_start_iso()).stream()
         for doc in todays:
             notification = doc.to_dict() or {}
+            if not is_important(notification):
+                continue
             for user_id in counts:
                 if is_visible_to(notification, user_id):
                     counts[user_id] += 1

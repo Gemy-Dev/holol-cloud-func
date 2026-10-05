@@ -119,12 +119,12 @@ class TestRecipients:
         assert sorted(tokens) == ['token-arabic', 'token-english', 'token-rep']
 
     def test_reviewer_is_not_notified_of_their_own_review(self):
-        # An administrator may sign the sales-manager slot; they still hold the
-        # admin role, and must not be told about what they just did (FR-022).
+        # The actor is an administrator even when they sign the sales-manager
+        # slot; the other audience is the sales managers, from their actual role.
         _, _, tokens = _call(_team(), reviewer='admin-1')
 
         assert 'token-admin-1' not in tokens
-        assert sorted(tokens) == ['token-admin-2', 'token-rep']
+        assert sorted(tokens) == ['token-manager-1', 'token-manager-2', 'token-rep']
 
     def test_representative_who_reviewed_their_own_report_is_not_notified(self):
         _, _, tokens = _call(_team(), reviewer='rep')
