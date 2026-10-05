@@ -45,9 +45,10 @@ COLLECTION = "notifications"
 # notification addressed to the viewer come back from one query.
 ALL = "all"
 
-# The events the app's notification page lists. Everything else — date
-# changes, deletions, edits, reminders — is pushed but not listed, so the
-# page holds only what someone has to act on.
+# The events the app's notification page lists. Everything else — deletions,
+# other edits, app updates — is pushed but not listed, so the page holds only
+# what someone has to act on. Client additions and edits and task date changes
+# are listed: they reach the admins, sales managers and representatives.
 IMPORTANT_EVENTS = frozenset({
     "pending_review", "daily_tasks", "weekly_schedule", "kpi_review",
     "opportunity_action", "missed_task", "support_due", "support_overdue",
@@ -58,6 +59,11 @@ IMPORTANT_EVENTS = frozenset({
     "review",
     "support_record_added",
     "support_visit_added",
+    "client_added",
+    "client_updated",
+    "task_date_set",
+    "task_date_changed",
+    "task_date_reset",
 })
 
 # App builds released before senders named their event, told apart by the
@@ -71,6 +77,8 @@ _LEGACY_APP_TITLES = {
     "إضافة سجل دعم فني جديد": "support_record_added",
     "🔔 Add: Visit Technical Support": "support_visit_added",
     "🔔 Add: Main Opportunity": "opportunity_added",
+    "🔔 Add: Client": "client_added",
+    "تحديث معلومات العميل": "client_updated",
 }
 
 

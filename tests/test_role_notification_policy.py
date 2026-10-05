@@ -26,7 +26,8 @@ def seed_users(db):
     ('task_completed', 'rep', {'mgr', 'adm'}),
     ('task_completed', 'tech', {'mgr', 'adm'}),
     ('activity_added', 'rep', {'mgr', 'adm'}),
-    ('activity_added', 'mgr', set()),
+    ('activity_added', 'mgr', {'adm'}),
+    ('activity_added', 'adm', {'mgr'}),
     ('opportunity_added', 'rep', {'mgr', 'adm'}),
     ('opportunity_added', 'mgr', {'adm', 'rep'}),
     ('opportunity_added', 'adm', {'mgr', 'rep'}),
@@ -71,11 +72,118 @@ def test_assigned_support_activity_only_reaches_its_technician_and_reviewers(db)
 
 def test_linked_opportunity_action_is_an_activity_not_a_new_opportunity(db):
     seed_users(db)
-    db._put('tasks', 't', {'mainOpportunityId': 'o'})
-    result = deliver_event(db, actor_id='adm', event='opportunity_added',
-                           route={'taskId': 't'}, title='نشاط', body='تفاصيل', source='dashboard')
-    assert result['skipped'] == 'no_audience'
-    assert db._get_all('notifications') == {}
+    db._put('tasks', 't', {'mainOpportunityId': 'o', 'assignedToId': 'rep'})
+    deliver_event(db, actor_id='adm', event='opportunity_added',
+                  route={'taskId': 't'}, title='نشاط', body='تفاصيل', source='dashboard')
+    record, = db._get_all('notifications').values()
+    assert record['event'] == 'activity_added'
+    assert set(record['recipientIds']) == {'mgr', 'rep'}
+
+
+@pytest.mark.parametrize('actor,expected', [
+    ('rep', {'mgr', 'adm'}),
+    ('mgr', {'adm', 'rep'}),
+    ('adm', {'mgr', 'rep'}),
+])
+def test_activity_from_any_side_reaches_admin_manager_and_its_representative(db, actor, expected):
+    seed_users(db)
+    db._put('users', 'other-rep', USERS['rep'])
+    db._put('tasks', 't', {'assignedToId': 'rep', 'taskType': 'appointment'})
+    deliver_event(db, actor_id=actor, event='activity_added', route={'taskId': 't'},
+                  title='نشاط', body='تفاصيل', source='app')
+    record, = db._get_all('notifications').values()
+    assert set(record['recipientIds']) == expected
+    assert record['title'] == {
+        'rep': 'المندوب أضاف نشاطاً', 'mgr': 'مدير المبيعات أضاف نشاطاً',
+        'adm': 'مسؤول النظام أضاف نشاطاً'}[actor]
+
+
+@pytest.mark.parametrize('event,title', [
+    ('client_added', 'إضافة عميل جديد'),
+    ('client_updated', 'تعديل معلومات عميل'),
+])
+@pytest.mark.parametrize('actor', ['rep', 'mgr', 'adm'])
+def test_client_added_or_edited_reaches_admins_managers_and_representatives(db, event, title, actor):
+    seed_users(db)
+    db._put('users', 'other-rep', USERS['rep'])
+    db._put('clients', 'c', {'name': 'مستشفى'})
+    deliver_event(db, actor_id=actor, event=event, route={'action': 'open_client', 'clientId': 'c'},
+                  title='عميل', body='تفاصيل', source='app')
+    record, = db._get_all('notifications').values()
+    assert set(record['recipientIds']) == {'mgr', 'adm', 'rep', 'other-rep'} - {actor}
+    assert 'tech' not in record['recipientIds']
+    assert record['title'] == title and record['important'] is True
+
+
+def test_a_new_client_is_announced_once_but_every_edit_is_announced(db):
+    seed_users(db)
+    db._put('clients', 'c', {})
+    route = {'clientId': 'c'}
+    for _ in range(2):
+        deliver_event(db, actor_id='rep', event='client_added', route=route,
+                      title='عميل', body='تفاصيل', source='app')
+        deliver_event(db, actor_id='rep', event='client_updated', route=route,
+                      title='عميل', body='تفاصيل', source='app')
+    events = sorted(r['event'] for r in db._get_all('notifications').values())
+    assert events == ['client_added', 'client_updated', 'client_updated']
+
+
+def test_unsynced_or_deleted_client_is_not_announced(db):
+    seed_users(db)
+    assert deliver_event(db, actor_id='rep', event='client_added', route={'clientId': 'c'},
+                         title='عميل', body='تفاصيل', source='app') is None
+    db._put('clients', 'c', {'reviewState': 'deleted'})
+    assert deliver_event(db, actor_id='rep', event='client_updated', route={'clientId': 'c'},
+                         title='عميل', body='تفاصيل', source='app') is None
+
+
+@pytest.mark.parametrize('event,title', [
+    ('task_date_set', 'تحديد تاريخ لمهمة'),
+    ('task_date_changed', 'تغيير تاريخ مهمة'),
+    ('task_date_reset', 'إعادة تعيين تاريخ مهمة'),
+])
+@pytest.mark.parametrize('actor,expected', [
+    ('rep', {'mgr', 'adm'}),
+    ('mgr', {'adm', 'rep'}),
+    ('adm', {'mgr', 'rep'}),
+])
+def test_task_date_reaches_admin_manager_and_the_tasks_representative(db, event, title, actor, expected):
+    seed_users(db)
+    db._put('users', 'other-rep', USERS['rep'])
+    db._put('tasks', 't', {'assignedToId': 'rep', 'taskType': 'planned', 'status': 'pending'})
+    deliver_event(db, actor_id=actor, event=event, route={'action': 'open_task', 'taskId': 't'},
+                  title='تاريخ', body='تفاصيل', source='dashboard')
+    deliver_event(db, actor_id=actor, event=event, route={'action': 'open_task', 'taskId': 't'},
+                  title='تاريخ', body='تفاصيل', source='dashboard')
+    records = list(db._get_all('notifications').values())
+    assert len(records) == 2  # each move is its own notice
+    assert all(set(r['recipientIds']) == expected and r['title'] == title for r in records)
+
+
+def test_legacy_broadcasts_of_client_and_date_events_follow_the_policy(db):
+    from modules.notifications import handle_send_notification_to_all
+    seed_users(db)
+    db._put('users', 'tech', {**USERS['tech'], 'receiveEmailNotifications': True})
+    db._put('clients', 'c', {})
+    db._put('tasks', 't', {'assignedToId': 'rep'})
+    sends = [
+        {'title': '🔔 Add: Client', 'userId': 'rep',
+         'notificationAction': {'action': 'open_client', 'clientId': 'c'}},
+        {'title': 'تحديث معلومات العميل', 'userId': 'rep',
+         'notificationAction': {'action': 'open_client', 'clientId': 'c'}},
+        {'title': 'تغيير تاريخ مهمة', 'source': 'dashboard',
+         'notificationAction': {'action': 'open_task', 'taskId': 't', 'event': 'task_date_changed'}},
+    ]
+    with patch('modules.notifications.messaging'):
+        for data in sends:
+            response, status = handle_send_notification_to_all({'uid': 'adm'}, {**data, 'body': 'تفاصيل'}, db)
+            assert status == 200 and response.get_json()['success'] is True
+    by_event = {r['event']: set(r['recipientIds']) for r in db._get_all('notifications').values()}
+    assert by_event == {
+        'client_added': {'mgr', 'rep'},
+        'client_updated': {'mgr', 'rep'},
+        'task_date_changed': {'mgr', 'rep'},
+    }
 
 
 def test_missing_or_deleted_record_never_announces(db):

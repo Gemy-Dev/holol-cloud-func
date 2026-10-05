@@ -1,4 +1,6 @@
 """Server-side audience policy for business events, shared by both clients."""
+import uuid
+
 from flask import jsonify
 from modules import notifications as n, notification_log
 
@@ -9,8 +11,11 @@ ROLE_SPELLINGS = {
     'technicalSupport': ['technicalSupport', 'Technical Support', 'technical support',
                          'technical_support', 'support', 'technician', 'دعم فني', 'مسؤول الدعم الفني'],
 }
+CLIENT_EVENTS = {'client_added', 'client_updated'}
+TASK_DATE_EVENTS = {'task_date_set', 'task_date_changed', 'task_date_reset'}
 EVENTS = {'task_completed', 'activity_added', 'opportunity_added',
-          'support_record_added', 'support_visit_added', 'support_activity_assigned'}
+          'support_record_added', 'support_visit_added', 'support_activity_assigned',
+          *CLIENT_EVENTS, *TASK_DATE_EVENTS}
 
 
 def role_of(user):
@@ -30,7 +35,16 @@ def users_for_roles(db, roles):
 
 
 def audience_roles(event, actor_role):
-    if event in ('task_completed', 'activity_added') and actor_role == 'salesRepresentative':
+    # Adding or editing a client reaches every admin, sales manager and
+    # representative, whoever made the change.
+    if event in CLIENT_EVENTS:
+        return ('admin', 'salesManager', 'salesRepresentative')
+    # An activity from any side, and a task's date being set, moved or reset,
+    # reach the admins and sales managers; the task's own representative is
+    # added from the record in deliver_event.
+    if event == 'activity_added' or event in TASK_DATE_EVENTS:
+        return ('salesManager', 'admin')
+    if event == 'task_completed' and actor_role == 'salesRepresentative':
         return ('salesManager', 'admin')
     if event in ('task_completed', 'support_visit_added', 'support_record_added') and actor_role == 'technicalSupport':
         return ('salesManager', 'admin')
@@ -77,6 +91,18 @@ def deliver_event(db, *, actor_id, event, route, title, body, source):
         if event == 'opportunity_added' and task.get('mainOpportunityId'):
             event = 'activity_added'
         identity = route['taskId']
+        # A date can be set, moved and reset again on the same task, so each
+        # change is its own notice rather than one claim per task.
+        if event in TASK_DATE_EVENTS:
+            identity = route['taskId'] + '-' + uuid.uuid4().hex
+    elif route.get('clientId') and event in CLIENT_EVENTS:
+        if not _live(_read(db, 'clients', route['clientId'])):
+            return None
+        # One announcement per new client, shared by the immediate send and the
+        # offline replay; every edit is announced on its own.
+        identity = route['clientId']
+        if event == 'client_updated':
+            identity += '-' + uuid.uuid4().hex
     elif route.get('reportId'):
         if not _live(_read(db, 'reports', route['reportId'])):
             return None
@@ -104,6 +130,13 @@ def deliver_event(db, *, actor_id, event, route, title, body, source):
         return {'skipped': 'missing_record'}
 
     candidates = users_for_roles(db, audience_roles(event, actor_role))
+    # The representative the activity or task belongs to hears about it too.
+    if task and (event in TASK_DATE_EVENTS or event == 'activity_added'):
+        owner_id = task.get('assignedToId')
+        owner = _read(db, 'users', owner_id) or {}
+        if (owner.get('isActive') is True
+                and (event in TASK_DATE_EVENTS or role_of(owner) == 'salesRepresentative')):
+            candidates[owner_id] = owner
     technician = None
     # A newly assigned support activity has its own wording and claim, so
     # technicians see the instruction and managers see the rep's addition.
@@ -115,7 +148,16 @@ def deliver_event(db, *, actor_id, event, route, title, body, source):
             technician = assignee
     titles = {
         'task_completed': 'إنجاز مهمة دعم فني' if actor_role == 'technicalSupport' else 'المندوب أنجز مهمة',
-        'activity_added': 'المندوب أضاف نشاطاً',
+        'activity_added': {
+            'salesRepresentative': 'المندوب أضاف نشاطاً',
+            'salesManager': 'مدير المبيعات أضاف نشاطاً',
+            'admin': 'مسؤول النظام أضاف نشاطاً',
+        }.get(actor_role, 'إضافة نشاط'),
+        'client_added': 'إضافة عميل جديد',
+        'client_updated': 'تعديل معلومات عميل',
+        'task_date_set': 'تحديد تاريخ لمهمة',
+        'task_date_changed': 'تغيير تاريخ مهمة',
+        'task_date_reset': 'إعادة تعيين تاريخ مهمة',
         'opportunity_added': 'إضافة فرصة',
         'support_record_added': 'إضافة سجل دعم فني',
         'support_visit_added': 'إنجاز مهمة دعم فني',

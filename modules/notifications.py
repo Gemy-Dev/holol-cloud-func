@@ -428,8 +428,7 @@ def handle_send_notification_to_all(decoded_token, data, db):
             return business_notifications.handle_business_notification(
                 decoded_token, {**data, 'event': event, 'notificationAction': message_data}, db
             )
-        if ((event and event.startswith('task_date_'))
-                or message_data.get('entityType') in ('task', 'appointment', 'opportunity')
+        if (message_data.get('entityType') in ('task', 'appointment', 'opportunity')
                 or message_data.get('action') in ('open_support_record', 'open_main_opportunity')
                 or _disabled_business_route(message_data)):
             return jsonify({'success': True, 'skipped': 'event_disabled'}), 200

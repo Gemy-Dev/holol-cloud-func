@@ -379,10 +379,15 @@ class TestImportance:
         assert record['important'] is True
 
     def test_a_named_push_only_event_is_not(self, db):
-        record = self._record(db, data={'event': 'task_date_changed'})
+        record = self._record(db, data={'event': 'deal_updated'})
 
-        assert record['event'] == 'task_date_changed'
+        assert record['event'] == 'deal_updated'
         assert record['important'] is False
+
+    def test_client_and_task_date_events_are_listed(self, db):
+        for event in ('client_added', 'client_updated', 'task_date_set',
+                      'task_date_changed', 'task_date_reset'):
+            assert self._record(db, data={'event': event})['important'] is True
 
     def test_every_review_is_listed(self, db):
         assert self._record(db, kind='review', source='dashboard')['important'] is True
