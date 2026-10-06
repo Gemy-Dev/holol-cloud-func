@@ -259,6 +259,24 @@ setup_schedulers() {
             --project=$PROJECT_ID
     fi
 
+    # One tick every 15 minutes evaluates the canonical records. Hour/day guards inside
+    # the handler keep weekly and daily notices on their agreed Iraq schedule.
+    if gcloud scheduler jobs describe role-reminders --location="$REGION" --project="$PROJECT_ID" &>/dev/null; then
+        gcloud scheduler jobs update http role-reminders \
+            --schedule="*/15 * * * *" --time-zone="Asia/Baghdad" \
+            --uri="$FUNCTION_URL" --http-method=POST \
+            --update-headers="Content-Type=application/json" \
+            --message-body='{"action":"role_reminders"}' \
+            --location="$REGION" --project="$PROJECT_ID"
+    else
+        gcloud scheduler jobs create http role-reminders \
+            --schedule="*/15 * * * *" --time-zone="Asia/Baghdad" \
+            --uri="$FUNCTION_URL" --http-method=POST \
+            --headers="Content-Type=application/json" \
+            --message-body='{"action":"role_reminders"}' \
+            --location="$REGION" --project="$PROJECT_ID"
+    fi
+
     return $?
 }
 

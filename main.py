@@ -52,7 +52,9 @@ from modules.apk_manager import (
     delete_apk_version,
 )
 from modules.opportunities import get_opportunity_stats
-from modules.review_reminders import handle_report_saved, handle_review_reminders
+from modules.review_reminders import handle_report_saved
+from modules.business_notifications import handle_business_notification
+from modules.role_reminders import handle_role_reminders
 from modules.special_requests import (
     handle_decide_special_request,
     handle_edit_special_request_note,
@@ -120,9 +122,12 @@ def route_request(action, data, request):
     elif action == "notify_tomorrow_tasks":
         return handle_daily_notifications(db, days_offset=1)
 
-    # 8 AM Iraq time - each reviewer's summary of pending reviews (spec 2038)
+    # Compatibility route for the former morning digest; now uses role policy.
     elif action == "review_reminders":
-        return handle_review_reminders(db)
+        return handle_role_reminders(db)
+
+    elif action == "role_reminders":
+        return handle_role_reminders(db)
     
     # Get all tasks stats (no auth required - for admin use)
     elif action == "getAllTasksStats":
@@ -141,6 +146,14 @@ def route_request(action, data, request):
     if error:
         return error, status
     
+    if action == "sendBusinessNotification":
+        return handle_business_notification(decoded_token, data, db)
+
+    if action in ("syncTaskReminderSchedule", "syncUndatedTaskReminderSchedule"):
+        # Compatibility for older builds: reminders now read canonical records
+        # hourly, so no client-controlled schedule or second queue is needed.
+        return jsonify({"success": True, "reason": "server_managed"}), 200
+
     if action == "getProducts":
         return get_products(decoded_token, db)
     

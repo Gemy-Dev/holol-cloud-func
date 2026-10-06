@@ -76,8 +76,8 @@ def _iso(days_ago=0, hour=10):
 
 class TestBroadcastIsRecorded:
     def _send(self, db, payload=None, uid='sender'):
-        data = {'title': 'إضافة عميل', 'body': 'العميل: مستشفى', 'userId': uid,
-                'notificationAction': {'action': 'open_client', 'clientId': 'c1'}}
+        data = {'title': 'إعلان', 'body': 'العميل: مستشفى', 'userId': uid,
+                'notificationAction': {'action': 'info'}}
         data.update(payload or {})
         with patch('modules.notifications.messaging', _patched_messaging()) as m:
             response = handle_send_notification_to_all({'uid': uid}, data, db)
@@ -97,8 +97,8 @@ class TestBroadcastIsRecorded:
         assert record['senderId'] == 'sender'
         assert record['senderName'] == 'أحمد'
         assert record['source'] == 'app'
-        assert record['title'] == 'إضافة عميل'
-        assert record['data'] == {'action': 'open_client', 'clientId': 'c1'}
+        assert record['title'] == 'إعلان'
+        assert record['data'] == {'action': 'info'}
         assert is_contract_iso(record['createdAt'])
         assert record['delivery'] == {'successCount': 1, 'failureCount': 0}
         assert 'isRead' not in record, 'there is no read state'
@@ -111,7 +111,7 @@ class TestBroadcastIsRecorded:
         [record] = _records(db)
         sent_data = m.MulticastMessage.call_args.kwargs['data']
         assert sent_data['notificationId'] == record['id']
-        assert sent_data['action'] == 'open_client'
+        assert sent_data['action'] == 'info'
 
     def test_sender_comes_from_the_token_not_the_payload(self, db):
         db._put('users', 'rep', _user('token-rep'))
@@ -201,7 +201,7 @@ class TestReviewIsRecorded:
         db._put('users', 'rep', _user('token-rep', role='salesRepresentative'))
         db._put('users', 'admin-1', _user('token-a1', role='admin'))
         db._put('users', 'admin-off', _user('token-a2', preference=False, role='admin'))
-        db._put('users', 'reviewer', _user('token-r', role='admin'))
+        db._put('users', 'reviewer', _user('token-r', role='salesManager'))
         data = {'title': 'مراجعة مدير المبيعات', 'body': 'b', 'reviewerRole': 'salesManager',
                 'representativeId': 'rep',
                 'notificationAction': {'action': 'open_daily_report', 'reportId': 'r1'}}
@@ -227,11 +227,11 @@ class TestDailyReminder:
     def _task(self, db, task_id, assignee, **extra):
         today = datetime.now(IRAQ_TIMEZONE).replace(hour=9, minute=0, second=0, microsecond=0)
         db._put('tasks', task_id, {'title': task_id, 'assignedToId': assignee,
-                                   'targetDate': to_iso(today), **extra})
+                                   'targetDate': to_iso(today), 'status': 'pending', **extra})
 
     def test_each_user_is_reminded_of_their_own_tasks_only(self, db):
-        db._put('users', 'rep-1', _user('token-1'))
-        db._put('users', 'rep-2', _user('token-2'))
+        db._put('users', 'rep-1', _user('token-1', role='salesRepresentative'))
+        db._put('users', 'rep-2', _user('token-2', role='salesRepresentative'))
         self._task(db, 'visit-a', 'rep-1')
         self._task(db, 'visit-b', 'rep-1')
         self._task(db, 'visit-c', 'rep-2')
@@ -250,7 +250,7 @@ class TestDailyReminder:
         assert by_user['rep-1']['senderId'] is None
 
     def test_a_second_run_does_not_remind_twice(self, db):
-        db._put('users', 'rep-1', _user('token-1'))
+        db._put('users', 'rep-1', _user('token-1', role='salesRepresentative'))
         self._task(db, 'visit-a', 'rep-1')
 
         self._run(db)
@@ -261,7 +261,7 @@ class TestDailyReminder:
         assert len(_records(db)) == 1
 
     def test_user_without_a_device_still_gets_the_record(self, db):
-        db._put('users', 'rep-1', _user(token=None))
+        db._put('users', 'rep-1', _user(token=None, role='salesRepresentative'))
         self._task(db, 'visit-a', 'rep-1')
 
         (body, _), _ = self._run(db)
@@ -301,10 +301,10 @@ class TestTodaysCount:
         self._seed(db, 'someone-else', ['other'])
         self._seed(db, 'yesterday', ['all'], days_ago=1)
 
-        assert notification_log.todays_counts(db, ['rep']) == {'rep': 2}
+        assert notification_log.todays_counts(db, ['rep']) == {'rep': 1}
 
     def test_only_important_ones_count(self, db):
-        self._seed(db, 'completed', ['all'])
+        self._seed(db, 'completed', ['rep'])
         self._seed(db, 'date-changed', ['all'], important=False)
 
         assert notification_log.todays_counts(db, ['rep']) == {'rep': 1}
@@ -321,10 +321,12 @@ class TestTodaysCount:
         assert notification_log.todays_counts(db, ['rep']) == {'rep': 1}
 
     def test_the_badge_is_sent_with_the_push(self, db):
-        self._seed(db, 'earlier', ['all'])
-        db._put('users', 'rep', _user('token-rep'))
+        self._seed(db, 'earlier', ['rep'])
+        db._put('users', 'rep', _user('token-rep', role='salesManager'))
+        db._put('users', 'manager', _user('actor', role='salesRepresentative'))
+        db._put('tasks', 't', {'status': 'completed'})
         data = {'title': 'إنجاز مهمة', 'body': 'b',
-                'notificationAction': {'action': 'open_task', 'event': 'task_completed'}}
+                'notificationAction': {'action': 'open_task', 'event': 'task_completed', 'taskId': 't'}}
 
         with patch('modules.notifications.messaging', _patched_messaging()) as m:
             handle_send_notification_to_all({'uid': 'manager'}, data, db)
@@ -334,7 +336,7 @@ class TestTodaysCount:
         assert kwargs['android'].notification.notification_count == 2
 
     def test_a_push_only_notification_leaves_the_count_alone(self, db):
-        self._seed(db, 'earlier', ['all'])
+        self._seed(db, 'earlier', ['rep'])
         db._put('users', 'rep', _user('token-rep'))
         data = {'title': 'تغيير تاريخ مهمة', 'body': 'b'}
 
@@ -345,9 +347,11 @@ class TestTodaysCount:
 
     def test_recipients_with_different_counts_get_their_own_badge(self, db):
         self._seed(db, 'only-for-a', ['rep-a'])
-        db._put('users', 'rep-a', _user('token-a'))
-        db._put('users', 'rep-b', _user('token-b'))
-        data = {'title': 't', 'body': 'b', 'notificationAction': {'event': 'activity_added'}}
+        db._put('users', 'rep-a', _user('token-a', role='salesManager'))
+        db._put('users', 'rep-b', _user('token-b', role='admin'))
+        db._put('users', 'manager', _user('actor', role='salesRepresentative'))
+        db._put('tasks', 't', {})
+        data = {'title': 't', 'body': 'b', 'notificationAction': {'event': 'activity_added', 'taskId': 't'}}
 
         with patch('modules.notifications.messaging', _patched_messaging()) as m:
             handle_send_notification_to_all({'uid': 'manager'}, data, db)

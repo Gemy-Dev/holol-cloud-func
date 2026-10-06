@@ -300,33 +300,28 @@ def test_a_stripped_old_shape_visit_with_an_awaiting_record_can_still_be_decided
 
 # --- rejection notice --------------------------------------------------------------------
 
-def test_a_rejection_notifies_the_rep_and_names_the_client_the_rep_the_slot_and_the_note(db):
+def test_a_rejection_keeps_the_decision_without_an_unlisted_role_notice(db):
     _seed(db)
     _decide(db, decision='rejected', note='غير متاح')
-    notes = [n for n in db._get_all('notifications').values() if n['kind'] == 'special_request']
-    assert len(notes) == 1
-    note = notes[0]
-    assert note['title'] == 'تم رفض الطلب الخاص'
-    for needle in ('عيادة النور', 'المندوب', 'مدير المبيعات', 'غير متاح'):
-        assert needle in note['body']
-    assert note['recipientIds'] == [REP]
-    assert note['data']['action'] == 'open_daily_report' and note['data']['reportId'] == 'r1'
+    assert _doc(db)['state'] == 'rejected'
+    assert _doc(db)['salesManagerDecision']['note'] == 'غير متاح'
+    assert not any(n['kind'] == 'special_request' for n in db._get_all('notifications').values())
 
 
-def test_a_visit_rejection_opens_the_support_record(db):
+def test_a_visit_rejection_keeps_the_decision_without_an_extra_push(db):
     _seed(db, source='visit')
     db._put('users', MGR, _user(perms=('reviewTechnicalReport',)))
     _decide(db, sourceType='visit', supportRecordId='s1', visitId='v1', reportId=None, decision='rejected')
-    note = next(n for n in db._get_all('notifications').values() if n['kind'] == 'special_request')
-    assert note['data']['action'] == 'open_support_record'
-    assert note['data']['supportRecordId'] == 's1'
+    assert _doc(db, 'visit_s1_v1')['state'] == 'rejected'
+    assert not any(n['kind'] == 'special_request' for n in db._get_all('notifications').values())
 
 
-def test_a_rejection_is_recorded_for_an_unreachable_rep(db):
+def test_an_unreachable_rep_does_not_receive_an_unlisted_notice(db):
     _seed(db)
     db._get_all('users')[REP]['fcmToken'] = None
     _decide(db, decision='rejected')
-    assert any(n['kind'] == 'special_request' for n in db._get_all('notifications').values())
+    assert _doc(db)['state'] == 'rejected'
+    assert not any(n['kind'] == 'special_request' for n in db._get_all('notifications').values())
 
 
 def test_an_approval_sends_no_rejection_notice(db):

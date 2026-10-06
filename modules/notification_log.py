@@ -49,6 +49,9 @@ ALL = "all"
 # changes, deletions, edits, reminders — is pushed but not listed, so the
 # page holds only what someone has to act on.
 IMPORTANT_EVENTS = frozenset({
+    "pending_review", "daily_tasks", "weekly_schedule", "kpi_review",
+    "opportunity_action", "missed_task", "support_due", "support_overdue",
+    "support_activity_assigned",
     "task_completed",
     "activity_added",
     "opportunity_added",
@@ -201,7 +204,8 @@ def is_visible_to(notification, user_id):
     recipients = notification.get("recipientIds") or []
     if user_id in recipients:
         return True
-    return ALL in recipients and notification.get("senderId") != user_id
+    return (not is_important(notification) and ALL in recipients
+            and notification.get("senderId") != user_id)
 
 
 def today_start_iso():

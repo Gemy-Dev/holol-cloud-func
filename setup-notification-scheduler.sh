@@ -92,3 +92,14 @@ echo ""
 echo "⚙️  To pause a job:"
 echo "  gcloud scheduler jobs pause notify-today-tasks --location=$REGION"
 echo "  gcloud scheduler jobs pause notify-tomorrow-tasks --location=$REGION"
+
+# Shared role reminders (every 15 minutes); safe alongside the two legacy daily jobs because all
+# handlers claim the same notification ids atomically.
+gcloud scheduler jobs create http role-reminders \
+  --location="$REGION" --schedule="*/15 * * * *" --time-zone="Asia/Baghdad" \
+  --uri="$FUNCTION_URL" --http-method=POST --headers="Content-Type=application/json" \
+  --message-body='{"action":"role_reminders"}' || \
+gcloud scheduler jobs update http role-reminders \
+  --location="$REGION" --schedule="*/15 * * * *" --time-zone="Asia/Baghdad" \
+  --uri="$FUNCTION_URL" --http-method=POST --update-headers="Content-Type=application/json" \
+  --message-body='{"action":"role_reminders"}'
