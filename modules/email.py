@@ -3,6 +3,7 @@ import smtplib
 import re
 import base64
 import traceback
+from html import escape
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from email.mime.application import MIMEApplication
@@ -360,6 +361,74 @@ def send_email(title, body, db):
         }), 500
 
 
+def _smtp_connect():
+    """An open SMTP connection, not yet logged in.
+
+    With a timeout, so a hung mail server fails the send (recorded, retryable)
+    instead of holding the request open until the function itself times out.
+    """
+    if EMAIL_SMTP_PORT == 465:
+        return smtplib.SMTP_SSL(EMAIL_SMTP_HOST, EMAIL_SMTP_PORT, timeout=SMTP_TIMEOUT_S)
+    server = smtplib.SMTP(EMAIL_SMTP_HOST, EMAIL_SMTP_PORT, timeout=SMTP_TIMEOUT_S)
+    server.starttls()
+    return server
+
+
+def send_text_email(recipients, subject, body_text, html=None):
+    """Email ``body_text`` to each recipient over one SMTP connection.
+
+    Args:
+        recipients: list of ``{"email", "name"}``. A known name adds an Arabic
+            greeting to both parts.
+        html: optional HTML rendering of the same body. When given, the message
+            is multipart/alternative, so clients that ignore plain-text
+            direction still lay the Arabic out right to left.
+
+    Returns:
+        ``{"sent": [emails], "failed": [{"email", "error"}]}``. One recipient
+        failing never stops the others.
+
+    Raises:
+        smtplib.SMTPException: connecting or logging in failed, so nothing was
+            sent. Callers map it to their own error response.
+    """
+    server = _smtp_connect()
+    sent = []
+    failed = []
+    try:
+        server.login(EMAIL_SMTP_USER, EMAIL_SMTP_PASSWORD)
+        for recipient in recipients:
+            recipient_email = recipient.get("email", "")
+            try:
+                recipient_name = recipient.get("name") or ""
+                greeting = f"مرحباً {recipient_name}،" if recipient_name else ""
+                msg = MIMEMultipart('alternative')
+                msg['From'] = f"{EMAIL_FROM_NAME} <{EMAIL_FROM_ADDRESS}>"
+                msg['To'] = recipient_email
+                msg['Subject'] = subject
+                text = f"{greeting}\n\n{body_text}" if greeting else body_text
+                msg.attach(MIMEText(text, 'plain', 'utf-8'))
+                if html is not None:
+                    html_greeting = f"<p>{escape(greeting)}</p>" if greeting else ""
+                    msg.attach(MIMEText(
+                        f'<div dir="rtl" style="font-family:Tahoma,Arial,sans-serif;'
+                        f'font-size:14px;line-height:1.7">{html_greeting}{html}</div>',
+                        'html', 'utf-8',
+                    ))
+                server.sendmail(EMAIL_FROM_ADDRESS, recipient_email, msg.as_string())
+                sent.append(recipient_email)
+                print(f"Email sent to: {recipient_email}")
+            except Exception as recipient_error:
+                failed.append({"email": recipient_email, "error": str(recipient_error)})
+                print(f"Failed to send email to {recipient_email}: {recipient_error}")
+    finally:
+        try:
+            server.quit()
+        except Exception:
+            pass
+    return {"sent": sent, "failed": failed}
+
+
 def send_pdf_email(recipients, subject, body_text, pdf_bytes, filename):
     """Email ``pdf_bytes`` to each recipient over one SMTP connection.
 
@@ -377,13 +446,7 @@ def send_pdf_email(recipients, subject, body_text, pdf_bytes, filename):
         smtplib.SMTPException: connecting or logging in failed, so nothing was
             sent. Callers map it to their own error response.
     """
-    # A timeout, so a hung mail server fails this send (recorded, retryable)
-    # instead of holding the request open until the function itself times out.
-    if EMAIL_SMTP_PORT == 465:
-        server = smtplib.SMTP_SSL(EMAIL_SMTP_HOST, EMAIL_SMTP_PORT, timeout=SMTP_TIMEOUT_S)
-    else:
-        server = smtplib.SMTP(EMAIL_SMTP_HOST, EMAIL_SMTP_PORT, timeout=SMTP_TIMEOUT_S)
-        server.starttls()
+    server = _smtp_connect()
 
     sent = []
     failed = []

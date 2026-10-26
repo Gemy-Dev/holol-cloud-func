@@ -720,6 +720,9 @@ def handle_send_review_notification(decoded_token, data, db):
     The reviewer is never told about their own review (FR-022), and a recipient
     who cannot be reached never stops the others — each is reported back under
     ``unreachable`` instead (FR-024).
+
+    The same audience is also emailed (see ``review_emails``). Push and email
+    are independent: either one failing still lets the other go out.
     """
     try:
         title = data.get("title")
@@ -730,7 +733,8 @@ def handle_send_review_notification(decoded_token, data, db):
                 "error": "title and body are required"
             }), 400
 
-        other_role = _OTHER_REVIEWER_ROLE.get(data.get("reviewerRole"))
+        slot_hint = data.get("reviewerRole")
+        other_role = _OTHER_REVIEWER_ROLE.get(slot_hint)
         if other_role is None:
             return jsonify({
                 "success": False,
@@ -751,26 +755,48 @@ def handle_send_review_notification(decoded_token, data, db):
             title = ('مسؤول النظام عمل مراجعة' if actor_role == 'admin'
                      else 'مدير المبيعات عمل مراجعة')
         representative_id = data.get("representativeId")
-        result = send_to_roles(
-            db,
-            roles=[other_role],
-            title=title,
-            body=body,
-            message_data=_message_data(data.get("notificationAction")),
-            kind="review",
-            source=notification_log.request_source(data),
-            actor_id=reviewer_id,
-            extra_user_ids=[representative_id] if representative_id else [],
-        )
-        result.pop("notificationId", None)
+        try:
+            result = send_to_roles(
+                db,
+                roles=[other_role],
+                title=title,
+                body=body,
+                message_data=_message_data(data.get("notificationAction")),
+                kind="review",
+                source=notification_log.request_source(data),
+                actor_id=reviewer_id,
+                extra_user_ids=[representative_id] if representative_id else [],
+            )
+            result.pop("notificationId", None)
+        except Exception as push_error:
+            print(f"❌ Review push failed: {push_error}")
+            print(traceback.format_exc())
+            result = {"successCount": 0, "failureCount": 0, "totalTokens": 0,
+                      "prunedTokens": 0, "unreachable": [], "pushError": str(push_error)}
         print(
             f"✅ Review notification sent to {result['successCount']} users, "
             f"{result['failureCount']} failed"
         )
+
+        from modules import review_emails
+        email = review_emails.send_review_email(
+            db,
+            actor_id=reviewer_id,
+            actor_role=_OTHER_REVIEWER_ROLE[other_role],
+            slot_hint=slot_hint,
+            route=data.get("notificationAction"),
+        )
+        if "pushError" in result and not email.get("sent"):
+            return jsonify({
+                "success": False,
+                "error": f"Error sending review notification: {result['pushError']}",
+                "email": email,
+            }), 500
         return jsonify({
             "success": True,
             "message": f"Notification sent to {result['successCount']} users",
             **result,
+            "email": email,
         }), 200
 
     except Exception as e:
