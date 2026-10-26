@@ -1,4 +1,7 @@
-"""The email that goes out with a review sign-off.
+"""The emails that go out to a report's reviewer roles.
+
+A review sign-off, and the notice that a report was deleted. Both reach the
+same audience, by the same rule.
 
 A review on a sales report, a technical-support report or a support visit is
 emailed to the representative who did the work and to every holder of the
@@ -15,6 +18,7 @@ import traceback
 from html import escape
 
 from modules import email as mail
+from modules import business_notifications as business
 from modules import notifications
 from modules import special_request_pdf as labels
 from modules import special_requests as sr
@@ -335,3 +339,141 @@ def send_review_email(db, *, actor_id, actor_role, slot_hint, route):
         print(traceback.format_exc())
         return {"error": str(error)}
 
+
+DELETE_LOG_COLLECTION = "report_delete_emails"
+
+
+def _deleted_audience(actor_role):
+    """The role told about a deletion by someone of ``actor_role``.
+
+    The same flip a review sign-off uses: a sales manager's action reaches the
+    administrators, an administrator's reaches the sales managers. Any other
+    role — a representative removing their own report — is reported to the
+    administrators, who own the system either way.
+    """
+    if actor_role == "admin":
+        return "salesManager"
+    return "admin"
+
+
+def _compose_deleted(report, actor_name, actor_role, audience_role):
+    """The subject, plain-text body and HTML body of a deletion notice."""
+    actor_label = _ROLE_LABELS.get(actor_role, "مستخدم")
+    actor = actor_name or actor_label
+    rows = [
+        ("نوع التقرير", _text(report.get("typeLabel"))),
+        ("المندوب", _text(report.get("repName"))),
+        ("العميل", _text(report.get("client"))),
+        ("النشاط", _text(report.get("activity"))),
+        ("تاريخ التقرير", _text(report.get("day"))),
+        ("من قام بالحذف", f"{actor} ({actor_label})"),
+        ("تاريخ الحذف", _minute(now_iso())),
+    ]
+    if report.get("taskReset") is True:
+        rows.append(
+            ("أثر الحذف", "أُعيدت المهمة المرتبطة إلى قيد الانجاز بدون تاريخ، "
+                          "كأنها لم تُنفَّذ"),
+        )
+    rows = [(label, value) for label, value in rows if value]
+
+    intro = f"قام {actor} ({actor_label}) بحذف تقرير."
+    outro = ("هذا الإشعار للعلم فقط. يمكنك مراجعة التفاصيل من لوحة التحكم.")
+    text = "\n".join([intro, "", *[f"{label}: {value}" for label, value in rows], "", outro])
+    html = (
+        f"<p>{escape(intro)}</p>"
+        '<table style="border-collapse:collapse">'
+        + "".join(
+            '<tr><td style="padding:4px 0 4px 16px;color:#555;vertical-align:top;'
+            f'white-space:nowrap"><b>{escape(label)}</b></td>'
+            f'<td style="padding:4px 0;white-space:pre-wrap">{escape(value)}</td></tr>'
+            for label, value in rows
+        )
+        + f"</table><p>{escape(outro)}</p>"
+    )
+    subject = "حذف تقرير"
+    type_label = _text(report.get("typeLabel"))
+    subject += f" - {type_label}" if type_label else ""
+    rep_name = _text(report.get("repName"))
+    subject += f" - {rep_name}" if rep_name else ""
+    return subject, text, html
+
+
+def send_report_deleted_email(db, *, actor_id, report, task_owner_id):
+    """Email a report's deletion to its audience. Never raises.
+
+    A deleted report is the only record that a visit happened, and deleting it
+    sends the task it completed back to never-executed — so the other manager
+    role is told, and so is the representative whose work it recorded.
+
+    Args:
+        actor_id: whoever deleted it, from the verified token. Their stored
+            role decides the audience, and they are never emailed themselves.
+        report: what to name in the notice — ``reportId`` plus any of
+            ``typeLabel``, ``repName``, ``client``, ``activity``, ``day`` and
+            ``taskReset``. Text only; nothing here grants anything.
+        task_owner_id: the representative the report belonged to, read before
+            the delete cleared it off the task.
+
+    Returns:
+        A summary for the response: ``sent``, ``failed`` and ``skipped``
+        recipients, or ``skippedReason`` / ``error`` when nothing was sent.
+    """
+    try:
+        report = report if isinstance(report, dict) else {}
+        report_id = _id(report.get("reportId"))
+        if not report_id:
+            return {"skippedReason": "report_id_missing"}
+
+        actor = (db.collection("users").document(actor_id).get().to_dict() or {}
+                 ) if actor_id else {}
+        actor_role = business.role_of(actor)
+        audience_role = _deleted_audience(actor_role)
+
+        # One document per report: a retried call for the same deletion must
+        # not email the same people twice.
+        log_ref = db.collection(DELETE_LOG_COLLECTION).document(report_id)
+        prior = log_ref.get()
+        if prior.exists and (prior.to_dict() or {}).get("status") == "sent":
+            return {"skippedReason": "already_sent"}
+
+        recipients, skipped = _recipients(
+            db, audience_role=audience_role, rep_id=task_owner_id, actor_id=actor_id)
+        for entry in skipped:
+            print(f"📭 Report-delete email not sent to {entry['userId']}: {entry['reason']}")
+        if not recipients:
+            return {"sent": [], "failed": [], "skipped": skipped}
+
+        config_valid, config_error = mail._check_email_config()
+        if not config_valid:
+            print(f"❌ Report-delete email not sent: {config_error}")
+            return {"error": "email_not_configured", "skipped": skipped}
+
+        subject, text, html = _compose_deleted(
+            report, _text(actor.get("name")), actor_role, audience_role)
+        try:
+            outcome = mail.send_text_email(recipients, subject, text, html=html)
+        except (smtplib.SMTPException, OSError) as error:
+            # Nothing went out; logged as failed so a later call tries again.
+            print(f"❌ Report-delete email SMTP failure: {error}")
+            outcome = {"sent": [], "failed": [{"email": r["email"], "error": str(error)}
+                                             for r in recipients]}
+
+        log_ref.set({
+            "status": "sent" if outcome["sent"] else "failed",
+            "reportId": report_id,
+            "deletedBy": actor_id,
+            "actorRole": actor_role,
+            "audienceRole": audience_role,
+            "subject": subject,
+            "sentTo": outcome["sent"],
+            "failed": outcome["failed"],
+            "skipped": skipped,
+            "updatedAt": now_iso(),
+        })
+        print(f"✅ Report-delete email sent to {len(outcome['sent'])}, "
+              f"{len(outcome['failed'])} failed, {len(skipped)} skipped")
+        return {"sent": outcome["sent"], "failed": outcome["failed"], "skipped": skipped}
+    except Exception as error:
+        print(f"❌ Report-delete email failed: {error}")
+        print(traceback.format_exc())
+        return {"error": str(error)}

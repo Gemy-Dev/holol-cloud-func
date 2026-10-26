@@ -54,6 +54,7 @@ from modules.apk_manager import (
 from modules.opportunities import get_opportunity_stats
 from modules.review_reminders import handle_report_saved
 from modules.business_notifications import handle_business_notification
+from modules.review_emails import send_report_deleted_email
 from modules.role_reminders import handle_role_reminders
 from modules.special_requests import (
     handle_decide_special_request,
@@ -267,6 +268,16 @@ def route_request(action, data, request):
             return jsonify({"error": "body is required"}), 400
 
         return send_email(title, body, db)
+
+    elif action == "notifyReportDeleted":
+        # Who deleted it comes from the verified token, never the payload: the
+        # caller's role is what decides the audience.
+        return jsonify(send_report_deleted_email(
+            db,
+            actor_id=decoded_token.get("uid"),
+            report=data.get("report"),
+            task_owner_id=data.get("taskOwnerId"),
+        )), 200
 
     elif action == "sendDailyReport":
         return send_daily_report(data, db)
