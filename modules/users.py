@@ -26,6 +26,8 @@ def create_user(data, decoded_token, db):
             email=email,
             password=password,
             display_name=data.get("name"),
+            # An account created inactive must not be able to sign in either.
+            disabled=data.get("isActive", True) is False,
         )
         
         # Rest of your user creation logic...
@@ -39,7 +41,7 @@ def create_user(data, decoded_token, db):
             "profileImageUrl": data.get("profileImageUrl"),
             "createdAt": now_iso(),
             "updatedAt": None,
-            "isActive": data.get("isActive", True),
+            "isActive": data.get("isActive", True) is not False,
             "lastLogin": None,
             "plans": data.get("plans", []),
             "visits": data.get("visits", []),
@@ -65,71 +67,137 @@ def create_user(data, decoded_token, db):
             return jsonify({"error": "Failed to create user"}), 500
 
 
-def update_user(data, decoded_token, db):
-    """Update an existing user"""
-    uid = data.get("id")
-    if not uid:
-        return jsonify({"error": "uid is required"}), 400
+# What an account may change on its own document through `update`. Everything
+# else (role, permissions, activation, status) needs `updateUser`.
+SELF_EDITABLE_FIELDS = ("name", "phoneNumber", "profileImageUrl")
 
-    if decoded_token["uid"] != uid:
-        user_doc = db.collection("users").document(decoded_token["uid"]).get()
-        if not user_doc.exists:
-            return jsonify({"error": "Unauthorized"}), 403
-
-    user_data = {
-        "name": data.get("name"),
-        "email": data.get("email"),
-        "role": data.get("role"),
-        "phoneNumber": data.get("phoneNumber"),
-        "permissions": data.get("permissions", []),
-        "profileImageUrl": data.get("profileImageUrl"),
-        "updatedAt": now_iso(),
-        "isActive": data.get("isActive", True),
-        "lastLogin": data.get("lastLogin"),
-        "plans": data.get("plans", []),
-        "visits": data.get("visits", []),
-        "customers": data.get("customers", []),
-        "status": data.get("status"),
-        "updatedBy": decoded_token["uid"]
-    }
-
-    user_data = {k: v for k, v in user_data.items() if v is not None}
-    db.collection("users").document(uid).update(user_data)
-    return jsonify({"success": True})
+# What a holder of `updateUser` may change through `update`. Email is absent on
+# purpose: it lives in Firebase Auth too, and changing only the document leaves
+# the sign-in address behind. Activation goes through `_apply_active` so the
+# Auth account follows the flag.
+MANAGED_FIELDS = SELF_EDITABLE_FIELDS + (
+    "role",
+    "permissions",
+    "status",
+    "plans",
+    "visits",
+    "customers",
+    "receiveEmailNotifications",
+)
 
 
-def delete_user(data, decoded_token, db):
-    """Delete a user from both Firebase Auth and Firestore"""
+def _apply_active(uid, is_active):
+    """Enable or disable the Auth account so the flag is enforced at sign-in.
+
+    Deactivating also revokes refresh tokens: a disabled account cannot mint a
+    new ID token, and the one it holds expires within the hour.
+    """
+    auth.update_user(uid, disabled=not is_active)
+    if not is_active:
+        auth.revoke_refresh_tokens(uid)
+
+
+def update_user(data, caller, db):
+    """Update fields on a user document.
+
+    Only the fields present in the request are written; a missing key is left
+    as it is, never reset to an empty default. The caller's own account may
+    change only SELF_EDITABLE_FIELDS unless they hold `updateUser`.
+    """
     uid = data.get("uid") or data.get("id")
     if not uid:
         return jsonify({"error": "uid is required"}), 400
 
-    # Verify the requesting user exists and has permission
-    user_doc = db.collection("users").document(decoded_token["uid"]).get()
-    if not user_doc.exists:
-        return jsonify({"error": "Unauthorized - requesting user not found"}), 403
+    if caller.has("updateUser"):
+        allowed = MANAGED_FIELDS
+    elif uid == caller.uid:
+        allowed = SELF_EDITABLE_FIELDS
+    else:
+        return jsonify({"error": "Permission denied"}), 403
 
-    errors = []
+    user_ref = db.collection("users").document(uid)
+    if not user_ref.get().exists:
+        return jsonify({"error": "User not found"}), 404
 
-    # Delete from Firebase Authentication
+    user_data = {k: data[k] for k in allowed if k in data}
+
+    if "isActive" in data and caller.has("updateUser"):
+        is_active = data["isActive"] is not False
+        if uid == caller.uid and not is_active:
+            return jsonify({"error": "You cannot deactivate your own account"}), 400
+        try:
+            _apply_active(uid, is_active)
+        except auth.UserNotFoundError:
+            pass
+        user_data["isActive"] = is_active
+
+    if not user_data:
+        return jsonify({"error": "No permitted fields to update"}), 400
+
+    user_data["updatedAt"] = now_iso()
+    user_data["updatedBy"] = caller.uid
+    user_ref.update(user_data)
+    return jsonify({"success": True})
+
+
+def set_user_active(data, caller, db):
+    """Activate or deactivate an account in both Firebase Auth and Firestore."""
+    uid = data.get("uid") or data.get("id")
+    if not uid:
+        return jsonify({"error": "uid is required"}), 400
+    if not isinstance(data.get("isActive"), bool):
+        return jsonify({"error": "isActive must be true or false"}), 400
+    is_active = data["isActive"]
+    if uid == caller.uid and not is_active:
+        return jsonify({"error": "You cannot deactivate your own account"}), 400
+
+    user_ref = db.collection("users").document(uid)
+    if not user_ref.get().exists:
+        return jsonify({"error": "User not found"}), 404
+
+    try:
+        _apply_active(uid, is_active)
+    except auth.UserNotFoundError:
+        # A document without a sign-in account: the flag still stops the
+        # server and the rules from acting for it.
+        pass
+    except Exception as error:
+        print(f"set_user_active: Auth update failed for {uid}: {error}")
+        return jsonify({"error": "Failed to update the sign-in account"}), 500
+
+    user_ref.update({
+        "isActive": is_active,
+        "updatedAt": now_iso(),
+        "updatedBy": caller.uid,
+    })
+    return jsonify({"success": True, "uid": uid, "isActive": is_active})
+
+
+def delete_user(data, caller, db):
+    """Delete a user from Firebase Auth, then from Firestore.
+
+    The document is removed only once the sign-in account is gone. Deleting the
+    document alone used to leave an account that could still sign in.
+    """
+    uid = data.get("uid") or data.get("id")
+    if not uid:
+        return jsonify({"error": "uid is required"}), 400
+    if uid == caller.uid:
+        return jsonify({"error": "You cannot delete your own account"}), 400
+
     try:
         auth.delete_user(uid)
     except auth.UserNotFoundError:
         pass
     except Exception as auth_error:
-        errors.append(f"Auth: {str(auth_error)}")
+        print(f"delete_user: Auth deletion failed for {uid}: {auth_error}")
+        return jsonify({"error": "Failed to delete the sign-in account", "uid": uid}), 500
 
-    # Always delete from Firestore, even if Auth deletion failed
     try:
         db.collection("users").document(uid).delete()
     except Exception as db_error:
-        errors.append(f"Firestore: {str(db_error)}")
-
-    if errors:
-        return jsonify({
-            "error": f"Partial delete failure: {'; '.join(errors)}",
-            "uid": uid
-        }), 500
+        print(f"delete_user: Firestore deletion failed for {uid}: {db_error}")
+        return jsonify({"error": "Sign-in account deleted, but the user record was not", "uid": uid}), 500
 
     return jsonify({
         "success": True,

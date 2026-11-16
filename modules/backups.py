@@ -304,19 +304,8 @@ def handle_delete_backup(decoded_token, data, db):
         JSON response with deletion status
     """
     try:
-        # Verify admin role
-        uid = decoded_token.get("uid") or decoded_token.get("user_id")
-        if not uid:
-            return jsonify({"error": "Invalid token"}), 403
-
-        user_doc = db.collection("users").document(uid).get()
-        if not user_doc.exists:
-            return jsonify({"error": "User not found"}), 404
-
-        user_data = user_doc.to_dict()
-        if user_data.get("role") != "admin":
-            return jsonify({"error": "Only admins can delete backups"}), 403
-
+        # Who may delete is decided by the `restoreBackup` grant at the route
+        # (modules/authz.py), the same grant that may restore or download.
         backup_timestamp = (
             data.get("backup_timestamp")
             or data.get("timestamp")
@@ -571,7 +560,7 @@ def handle_restore_backup(decoded_token, data):
         
         if not backup_timestamp:
             return jsonify({
-                "error": f"Backup timestamp is required. Received data: {data}",
+                "error": "Backup timestamp is required",
                 "success": False,
                 "timestamp": get_iraq_time().isoformat()
             }), 400
@@ -819,6 +808,69 @@ def delete_all_collections_data(collections: list):
         raise
 
 
+# How long a restore waits for its safety snapshot. The function times out at
+# 540 s; the rest of the budget is left for the delete and the import call.
+PRE_RESTORE_SNAPSHOT_TIMEOUT_S = 300
+_SNAPSHOT_POLL_INTERVAL_S = 5
+
+
+def _collections_in_backup(blob_names):
+    """Collection ids present in an export, from its `kind_<id>` folders.
+
+    An export of N collections holds one `kind_<id>` folder each. Restoring
+    only those keeps a collection the backup never held — one added to
+    COLLECTIONS_TO_BACKUP after it was taken — from being emptied and left
+    empty by the import.
+    """
+    found = set()
+    for name in blob_names:
+        for part in name.split("/"):
+            if part.startswith("kind_"):
+                found.add(part[len("kind_"):])
+    return [c for c in COLLECTIONS_TO_BACKUP if c in found]
+
+
+def _wait_for_operation(firestore_service, operation_name, timeout_s, sleep=None, clock=None):
+    """Poll a Firestore admin operation until it finishes.
+
+    Returns True when it completed without error, False on error or timeout.
+    """
+    import time
+
+    sleep = sleep or time.sleep
+    clock = clock or time.monotonic
+    deadline = clock() + timeout_s
+    while True:
+        operation = firestore_service.projects().databases().operations().get(
+            name=operation_name
+        ).execute()
+        if operation.get("done"):
+            if operation.get("error"):
+                print(f"❌ Operation {operation_name} failed: {operation['error']}")
+                return False
+            return True
+        if clock() >= deadline:
+            print(f"❌ Operation {operation_name} did not finish within {timeout_s}s")
+            return False
+        sleep(_SNAPSHOT_POLL_INTERVAL_S)
+
+
+def take_pre_restore_snapshot(firestore_service, project: str, timeout_s=PRE_RESTORE_SNAPSHOT_TIMEOUT_S):
+    """Export the current data and wait for it, so a restore can be undone.
+
+    Raises RuntimeError when the snapshot cannot be confirmed; the restore must
+    then not delete anything.
+    """
+    snapshot = create_firestore_backup_direct(firestore_service, project)
+    operation_name = snapshot.get("operation_name")
+    if not operation_name:
+        raise RuntimeError("Pre-restore snapshot did not start")
+    if not _wait_for_operation(firestore_service, operation_name, timeout_s):
+        raise RuntimeError("Pre-restore snapshot did not complete")
+    print(f"🛟 Pre-restore snapshot saved: {snapshot.get('timestamp')}")
+    return snapshot
+
+
 def restore_firestore_backup_direct(firestore_service, project: str, backup_timestamp: str):
     """Restore a Firestore backup from the specified timestamp - replaces ALL existing data"""
     try:
@@ -848,32 +900,41 @@ def restore_firestore_backup_direct(firestore_service, project: str, backup_time
             raise ValueError(f"Backup not found: {backup_timestamp}. Available backups: {list(all_backup_folders)}")
         
         print(f"📥 Found backup with {len(backup_blobs)} files")
-        
-        # Delete all existing data from collections before restoring
-        print(f"🗑️  Deleting all existing data from collections to ensure complete replacement...")
+
+        collections = _collections_in_backup(blob.name for blob in backup_blobs)
+        if not collections:
+            raise ValueError(f"Backup {backup_timestamp} holds none of the known collections")
+
+        # A restore replaces live data. Save what is there now, and wait for
+        # the save to finish, before anything is deleted: if it cannot be
+        # confirmed the restore stops here with the data untouched.
+        safety_snapshot = take_pre_restore_snapshot(firestore_service, project)
+
+        # Delete existing data only in the collections the backup holds.
+        print(f"🗑️  Deleting existing data from {collections} to ensure complete replacement...")
         deleted_counts = {}
         try:
-            deleted_counts = delete_all_collections_data(COLLECTIONS_TO_BACKUP)
+            deleted_counts = delete_all_collections_data(collections)
             print(f"✅ Successfully deleted existing data. Deleted counts: {deleted_counts}")
         except Exception as delete_error:
             print(f"⚠️  Warning: Failed to delete existing data: {str(delete_error)}")
             print(f"⚠️  Proceeding with restore anyway - existing documents will be overwritten")
-        
+
         name = f"projects/{project}/databases/(default)"
-        
+
         print(f"🔍 Debug: Starting importDocuments with:")
         print(f"  name: {name}")
         print(f"  inputUriPrefix: {backup_path}")
-        print(f"  collectionIds: {COLLECTIONS_TO_BACKUP}")
-        
+        print(f"  collectionIds: {collections}")
+
         request = firestore_service.projects().databases().importDocuments(
             name=name,
             body={
                 "inputUriPrefix": backup_path,
-                "collectionIds": COLLECTIONS_TO_BACKUP
+                "collectionIds": collections
             }
         )
-        
+
         print(f"🔍 Debug: About to execute importDocuments request...")
         response = request.execute()
         print(f"🔍 Debug: importDocuments response received:")
@@ -891,7 +952,8 @@ def restore_firestore_backup_direct(firestore_service, project: str, backup_time
                 "operation_name": fallback_name,
                 "backup_path": backup_path,
                 "backup_timestamp": backup_timestamp,
-                "collections": COLLECTIONS_TO_BACKUP,
+                "collections": collections,
+                "pre_restore_backup": safety_snapshot.get("timestamp"),
                 "status": "started_without_tracking",
                 "files_count": len(backup_blobs),
                 "deleted_documents": deleted_counts,
@@ -910,7 +972,8 @@ def restore_firestore_backup_direct(firestore_service, project: str, backup_time
             "operation_id": operation_id,
             "backup_path": backup_path,
             "backup_timestamp": backup_timestamp,
-            "collections": COLLECTIONS_TO_BACKUP,
+            "collections": collections,
+            "pre_restore_backup": safety_snapshot.get("timestamp"),
             "status": "started",
             "files_count": len(backup_blobs),
             "deleted_documents": deleted_counts,

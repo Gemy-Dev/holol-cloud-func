@@ -9,10 +9,17 @@ from datetime import timedelta, timezone
 IRAQ_TIMEZONE = timezone(timedelta(hours=3))
 
 BACKUP_BUCKET = "test-medical-80e1b-firestore-backups"
+# Collection ids exported by a backup. An id matches a collection group, so
+# "support_visits" covers technical_support/*/support_visits. A restore
+# replaces only the collections an export actually holds (backups.py
+# `_collections_in_backup`), so adding a name here never empties it when an
+# older backup that lacks it is restored.
 COLLECTIONS_TO_BACKUP = [
     "users", "products","deals", "clients", "tasks","daily_reports", "plans", "technical_support","main_opportunities",
     "departments", "specialties", "procedures", "companies",
-    "notifications", "reports", "analytics","manufacturers","opportunities","email_recipients"
+    "notifications", "reports", "analytics","manufacturers","opportunities","email_recipients",
+    "material_transfers", "special_requests", "marketing_tasks", "support_visits",
+    "visits", "roles", "downloads", "review_emails", "report_delete_emails",
 ]
 
 # Email configuration (Gmail)

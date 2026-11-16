@@ -9,10 +9,12 @@ import os
 
 # Import modules
 from modules.auth import verify_token, reset_password, set_password
+from modules.authz import authorize
 from modules.users import (
     create_user,
     update_user,
     delete_user,
+    set_user_active,
     migrate_notification_preference,
 )
 from modules.products import get_products, get_plan_products, get_clients, delete_client_and_tasks
@@ -110,16 +112,26 @@ def validate_action(action, data):
 
 
 def route_request(action, data, request):
-    """Route request to appropriate handler"""
-    # Scheduled notifications (no auth needed)
+    """Route request to appropriate handler.
+
+    Every action is authorized first (modules/authz.py): scheduled jobs by
+    their Cloud Scheduler OIDC token, everything else by the caller's Firebase
+    token, active account and permissions. An action without an entry in
+    `ACTION_REQUIREMENTS` is refused.
+    """
+    caller, error = authorize(action, request, db, data, verify_token)
+    if error:
+        return error
+
+    # Scheduled jobs (Cloud Scheduler only).
     if action == "daily_notifications":
         return handle_daily_notifications(db)
-    
+
     # 8 AM Iraq time - send today's tasks
     elif action == "notify_today_tasks":
         return handle_daily_notifications(db, days_offset=0)
-    
-    # 8 PM Iraq time - send tomorrow's tasks  
+
+    # 8 PM Iraq time - send tomorrow's tasks
     elif action == "notify_tomorrow_tasks":
         return handle_daily_notifications(db, days_offset=1)
 
@@ -129,9 +141,10 @@ def route_request(action, data, request):
 
     elif action == "role_reminders":
         return handle_role_reminders(db)
-    
-    # Get all tasks stats (no auth required - for admin use)
-    elif action == "getAllTasksStats":
+
+    decoded_token = caller.decoded_token
+
+    if action == "getAllTasksStats":
         return get_all_tasks_stats(db)
 
     # Get completed tasks status grouped by user, product, client
@@ -142,11 +155,6 @@ def route_request(action, data, request):
     elif action == "getOpportunityStats":
         return get_opportunity_stats(db)
 
-    # API actions (auth required)
-    decoded_token, error, status = verify_token(request)
-    if error:
-        return error, status
-    
     if action == "sendBusinessNotification":
         return handle_business_notification(decoded_token, data, db)
 
@@ -165,19 +173,18 @@ def route_request(action, data, request):
         return get_plan_products(plan_id, db)
     
     elif action == "update":
-        if "uid" not in data:
-            return jsonify({"error": "uid is required for update"}), 400
-        return update_user(data, decoded_token, db)
-    
+        return update_user(data, caller, db)
+
     elif action == "delete":
-        if "uid" not in data:
-            return jsonify({"error": "uid is required for delete"}), 400
-        return delete_user(data, decoded_token, db)
-    
+        return delete_user(data, caller, db)
+
     elif action == "create":
         if "email" not in data:
             return jsonify({"error": "email is required for create"}), 400
         return create_user(data, decoded_token, db)
+
+    elif action == "setUserActive":
+        return set_user_active(data, caller, db)
     
     elif action == "getClients":
         return get_clients(decoded_token, db)
@@ -211,7 +218,7 @@ def route_request(action, data, request):
     elif action == "getTasks":
         return get_tasks_paginated(data, db)
     
-    # Backup actions (admin only)
+    # Backup actions (gated on the backup grants in modules/authz.py)
     elif action == "manualBackup":
         return handle_manual_backup(decoded_token)
     
@@ -254,9 +261,9 @@ def route_request(action, data, request):
     
     elif action == "resetPassword":
         return reset_password(data, decoded_token)
-    
+
     elif action == "setPassword":
-        return set_password(data, decoded_token, db)
+        return set_password(data, caller)
     elif action == "sendEmail":
         title = data.get("title")
         body = data.get("body")
@@ -300,7 +307,7 @@ def route_request(action, data, request):
     elif action == "retrySpecialRequestSend":
         return handle_retry_special_request_send(decoded_token, data, db)
 
-    # APK Management (no auth required for download)
+    # APK Management (any active account may download)
     elif action == "getApkDownloadUrl":
         return get_apk_download_url(data, db)
 

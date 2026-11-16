@@ -33,6 +33,19 @@ BACKUP_BUCKET="${PROJECT_ID}-firestore-backups"
 # silent default.
 REVIEW_REMINDER_SINCE="${REVIEW_REMINDER_SINCE:-2099-01-01T00:00:00.000}"
 
+# The Gmail app password lives in Secret Manager, never in this file. Create it
+# once with:
+#   printf '%s' 'NEW_APP_PASSWORD' | gcloud secrets create email-smtp-password \
+#       --data-file=- --project=test-medical-80e1b
+# and add a version with `gcloud secrets versions add` when it is rotated.
+SMTP_SECRET_NAME="email-smtp-password"
+
+# Cloud Scheduler signs every call with an OIDC token for this account, and
+# main.py refuses the scheduled actions without it (modules/authz.py). The
+# audiences are every URL the function answers on; the jobs use the first.
+SCHEDULER_SA="${SCHEDULER_SA:-27531863258-compute@developer.gserviceaccount.com}"
+SCHEDULER_AUDIENCES="https://app-j6xtad2hmq-uc.a.run.app;https://app-27531863258.us-central1.run.app;https://us-central1-test-medical-80e1b.cloudfunctions.net/app"
+
 echo "🔧 Setting project configuration..."
 gcloud config set project $PROJECT_ID
 
@@ -47,6 +60,7 @@ check_apis() {
         "storage.googleapis.com"
         "cloudresourcemanager.googleapis.com"
         "pubsub.googleapis.com"
+        "secretmanager.googleapis.com"
     )
     
     for api in "${REQUIRED_APIS[@]}"; do
@@ -115,6 +129,19 @@ deploy_main_function() {
         CLEANUP_MAIN=false
     fi
     
+    # The SMTP password must already be in Secret Manager (see SMTP_SECRET_NAME
+    # above). Deploying without it would start a function that cannot email.
+    if ! gcloud secrets describe "$SMTP_SECRET_NAME" --project=$PROJECT_ID &>/dev/null; then
+        echo "❌ Secret '$SMTP_SECRET_NAME' not found. Create it first (see deploy.sh header)."
+        return 1
+    fi
+    # The function runs as the default compute account, which is also the
+    # account the scheduler jobs sign as.
+    gcloud secrets add-iam-policy-binding "$SMTP_SECRET_NAME" \
+        --member="serviceAccount:$SCHEDULER_SA" \
+        --role="roles/secretmanager.secretAccessor" \
+        --project=$PROJECT_ID >/dev/null
+
     DEPLOY_RESULT=0
     gcloud functions deploy app \
         --gen2 \
@@ -126,7 +153,8 @@ deploy_main_function() {
         --allow-unauthenticated \
         --memory=1Gi \
         --timeout=540s \
-        --set-env-vars="GOOGLE_CLOUD_PROJECT=$PROJECT_ID,ALLOWED_ORIGINS=*,EMAIL_SMTP_PASSWORD=dvgtizshxpxxefxn,REVIEW_REMINDER_SINCE=$REVIEW_REMINDER_SINCE" \
+        --set-env-vars="GOOGLE_CLOUD_PROJECT=$PROJECT_ID,ALLOWED_ORIGINS=*,REVIEW_REMINDER_SINCE=$REVIEW_REMINDER_SINCE,SCHEDULER_SERVICE_ACCOUNT=$SCHEDULER_SA,SCHEDULER_AUDIENCES=$SCHEDULER_AUDIENCES" \
+        --set-secrets="EMAIL_SMTP_PASSWORD=${SMTP_SECRET_NAME}:latest" \
         --max-instances=10 \
         --min-instances=0
     
@@ -185,6 +213,8 @@ setup_schedulers() {
             --http-method=POST \
             --update-headers="Content-Type=application/json" \
             --message-body='{"action":"daily_notifications"}' \
+            --oidc-service-account-email="$SCHEDULER_SA" \
+            --oidc-token-audience="$FUNCTION_URL" \
             --time-zone="UTC" \
             --location=$REGION \
             --project=$PROJECT_ID
@@ -196,6 +226,8 @@ setup_schedulers() {
             --http-method=POST \
             --headers="Content-Type=application/json" \
             --message-body='{"action":"daily_notifications"}' \
+            --oidc-service-account-email="$SCHEDULER_SA" \
+            --oidc-token-audience="$FUNCTION_URL" \
             --time-zone="UTC" \
             --location=$REGION \
             --description="Task notifications daily at 08:00 Iraq time" \
@@ -213,6 +245,8 @@ setup_schedulers() {
             --http-method=POST \
             --update-headers="Content-Type=application/json" \
             --message-body='{"action":"notify_tomorrow_tasks"}' \
+            --oidc-service-account-email="$SCHEDULER_SA" \
+            --oidc-token-audience="$FUNCTION_URL" \
             --time-zone="UTC" \
             --location=$REGION \
             --project=$PROJECT_ID
@@ -224,6 +258,8 @@ setup_schedulers() {
             --http-method=POST \
             --headers="Content-Type=application/json" \
             --message-body='{"action":"notify_tomorrow_tasks"}' \
+            --oidc-service-account-email="$SCHEDULER_SA" \
+            --oidc-token-audience="$FUNCTION_URL" \
             --time-zone="UTC" \
             --location=$REGION \
             --description="Tomorrow's task notifications daily at 20:00 Iraq time" \
@@ -242,6 +278,8 @@ setup_schedulers() {
             --http-method=POST \
             --update-headers="Content-Type=application/json" \
             --message-body='{"action":"review_reminders"}' \
+            --oidc-service-account-email="$SCHEDULER_SA" \
+            --oidc-token-audience="$FUNCTION_URL" \
             --time-zone="UTC" \
             --location=$REGION \
             --project=$PROJECT_ID
@@ -253,6 +291,8 @@ setup_schedulers() {
             --http-method=POST \
             --headers="Content-Type=application/json" \
             --message-body='{"action":"review_reminders"}' \
+            --oidc-service-account-email="$SCHEDULER_SA" \
+            --oidc-token-audience="$FUNCTION_URL" \
             --time-zone="UTC" \
             --location=$REGION \
             --description="Pending review summary daily at 08:00 Iraq time" \
@@ -267,6 +307,8 @@ setup_schedulers() {
             --uri="$FUNCTION_URL" --http-method=POST \
             --update-headers="Content-Type=application/json" \
             --message-body='{"action":"role_reminders"}' \
+            --oidc-service-account-email="$SCHEDULER_SA" \
+            --oidc-token-audience="$FUNCTION_URL" \
             --location="$REGION" --project="$PROJECT_ID"
     else
         gcloud scheduler jobs create http role-reminders \
@@ -274,6 +316,8 @@ setup_schedulers() {
             --uri="$FUNCTION_URL" --http-method=POST \
             --headers="Content-Type=application/json" \
             --message-body='{"action":"role_reminders"}' \
+            --oidc-service-account-email="$SCHEDULER_SA" \
+            --oidc-token-audience="$FUNCTION_URL" \
             --location="$REGION" --project="$PROJECT_ID"
     fi
 

@@ -15,83 +15,86 @@ def verify_token(request):
         decoded_token = auth.verify_id_token(token)
         return decoded_token, None, None
     except Exception as e:
-        return None, {"error": f"Invalid token: {str(e)}"}, 403
+        # The reason stays in the logs; the caller only learns it was refused.
+        print(f"verify_token: rejected token: {e}")
+        return None, {"error": "Invalid token"}, 403
+
+
+RESET_EMAIL_SUBJECT = "إعادة تعيين كلمة المرور - هلول طبية"
+
+
+def _reset_email_body(link):
+    return (
+        "تم طلب إعادة تعيين كلمة المرور لحسابك.\n\n"
+        f"لتعيين كلمة مرور جديدة افتح الرابط التالي:\n{link}\n\n"
+        "إذا لم تطلب ذلك يمكنك تجاهل هذه الرسالة."
+    )
 
 
 def reset_password(data, decoded_token):
-    """Reset password for a user by generating a password reset link.
-    
-    Args:
-        data: Request data containing 'uid' and 'email'
-        decoded_token: Decoded Firebase Auth token (for authorization)
-        
-    Returns:
-        JSON response with password reset link or error
+    """Email a password reset link to the account's own address.
+
+    The link is never returned in the response: whoever holds it can set the
+    account's password, so it goes only to the inbox of the account it opens.
+    The route is gated on `updateUser` (modules/authz.py).
     """
+    from modules.email import send_text_email
+
     uid = data.get("uid")
     email = data.get("email")
-    
+
     if not uid and not email:
         return jsonify({"error": "Either uid or email is required"}), 400
-    
+
     try:
-        # Get user by UID or email
-        if uid:
-            user = auth.get_user(uid)
-        else:
-            user = auth.get_user_by_email(email)
-        
-        # Generate password reset link
-        reset_link = auth.generate_password_reset_link(user.email)
-        
-        return jsonify({
-            "success": True,
-            "message": "Password reset link generated successfully",
-            "resetLink": reset_link,
-            "email": user.email,
-            "uid": user.uid
-        }), 200
-        
+        user = auth.get_user(uid) if uid else auth.get_user_by_email(email)
     except auth.UserNotFoundError:
         return jsonify({"error": "User not found"}), 404
     except Exception as e:
-        error_msg = f"Failed to reset password: {str(e)}"
-        return jsonify({"error": error_msg}), 500
+        print(f"reset_password: lookup failed: {e}")
+        return jsonify({"error": "Failed to reset password"}), 500
+
+    if not user.email:
+        return jsonify({"error": "User has no email address"}), 400
+
+    try:
+        reset_link = auth.generate_password_reset_link(user.email)
+        result = send_text_email(
+            [{"email": user.email, "name": user.display_name or ""}],
+            RESET_EMAIL_SUBJECT,
+            _reset_email_body(reset_link),
+        )
+    except Exception as e:
+        print(f"reset_password: sending failed for {user.uid}: {e}")
+        return jsonify({"error": "Failed to send the reset email"}), 502
+
+    if not result.get("sent"):
+        return jsonify({"error": "Failed to send the reset email"}), 502
+
+    return jsonify({
+        "success": True,
+        "message": "Password reset link sent to the user's email",
+        "email": user.email,
+        "uid": user.uid,
+    }), 200
 
 
-def set_password(data, decoded_token, db):
+def set_password(data, caller):
     """Set a user's password directly.
 
-    Args:
-        data: Request data containing 'uid' and 'password'
-        decoded_token: Decoded Firebase Auth token (for authorization)
-
-    Returns:
-        JSON response indicating success or error
+    Allowed for the account itself or a holder of `updateUser`; the route gate
+    in modules/authz.py has already enforced that, and it is checked again here
+    so the function is safe wherever it is called from.
     """
     uid = data.get("uid")
     password = data.get("password")
 
     if not uid or not password:
         return jsonify({"error": "Both 'uid' and 'password' are required"}), 400
+    if not isinstance(password, str) or len(password) < 6:
+        return jsonify({"error": "Password must be at least 6 characters long"}), 400
 
-    # Authorization: allow if requester is the same user or has an 'admin' claim
-    # Authorization: allow if requester is the same user or has an 'admin' role
-    requester_uid = decoded_token.get("uid") or decoded_token.get("user_id")
-    
-    is_admin = False
-    if requester_uid:
-        try:
-            requester_doc = db.collection("users").document(requester_uid).get()
-            if requester_doc.exists:
-                requester_data = requester_doc.to_dict()
-                if requester_data.get("role") == "admin":
-                    is_admin = True
-        except Exception:
-            # If we can't check role, assume not admin
-            pass
-
-    if requester_uid != uid and not is_admin:
+    if caller.uid != uid and not caller.has("updateUser"):
         return jsonify({"error": "Not authorized to change this user's password"}), 403
 
     try:
@@ -105,5 +108,5 @@ def set_password(data, decoded_token, db):
     except auth.UserNotFoundError:
         return jsonify({"error": "User not found"}), 404
     except Exception as e:
-        return jsonify({"error": f"Failed to set password: {str(e)}"}), 500
-
+        print(f"set_password: failed for {uid}: {e}")
+        return jsonify({"error": "Failed to set password"}), 500
