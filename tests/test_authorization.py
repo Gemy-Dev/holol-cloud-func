@@ -378,38 +378,12 @@ def test_set_user_active_requires_a_boolean(db):
     assert status == 400
 
 
-def test_delete_user_keeps_the_record_when_auth_deletion_fails(db):
-    from modules import users
-
-    _seed_user(db, "mgr", permissions=["deleteUser"])
-    _seed_user(db, "rep")
-    with patch.object(users.auth, "delete_user", side_effect=RuntimeError("boom")):
-        _, status = _body(users.delete_user({"uid": "rep"}, _caller(db, "mgr"), db))
-    assert status == 500
-    assert "rep" in db._get_all("users")
-
-
-def test_delete_user_removes_both(db):
-    from modules import users
-
-    _seed_user(db, "mgr", permissions=["deleteUser"])
-    _seed_user(db, "rep")
-    with patch.object(users.auth, "delete_user") as delete:
-        _, status = _body(users.delete_user({"uid": "rep"}, _caller(db, "mgr"), db))
-    assert status == 200
-    delete.assert_called_once_with("rep")
-    assert "rep" not in db._get_all("users")
-
-
-def test_delete_user_refuses_self(db):
-    from modules import users
-
-    _seed_user(db, "mgr", permissions=["deleteUser"])
-    with patch.object(users.auth, "delete_user") as delete:
-        _, status = _body(users.delete_user({"uid": "mgr"}, _caller(db, "mgr"), db))
-    assert status == 400
-    delete.assert_not_called()
-
+def test_an_account_cannot_be_deleted_only_deactivated(db):
+    """Deleting a user is gone: the account is deactivated instead, and keeps
+    its link to the tasks and reports it filed."""
+    _seed_user(db, "mgr", permissions=["updateUser", "deleteUser"])
+    caller, error = authorize("delete", _request(), db, {"uid": "rep"}, _verify_ok("mgr"))
+    assert caller is None and _status(error) == 403
 
 def test_create_user_inactive_is_disabled_in_auth(db):
     from modules import users

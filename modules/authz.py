@@ -110,7 +110,6 @@ ACTION_REQUIREMENTS = {
     # Users.
     "create": ("addUser",),
     "update": (SELF_OR, "updateUser"),
-    "delete": ("deleteUser",),
     "setUserActive": ("updateUser",),
     "setUserEmail": ("updateUser",),
     "resetPassword": ("updateUser",),

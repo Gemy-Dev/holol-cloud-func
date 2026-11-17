@@ -13,7 +13,6 @@ from modules.authz import authorize
 from modules.users import (
     create_user,
     update_user,
-    delete_user,
     set_user_active,
     set_user_email,
     migrate_notification_preference,
@@ -180,9 +179,6 @@ def route_request(action, data, request):
     
     elif action == "update":
         return update_user(data, caller, db)
-
-    elif action == "delete":
-        return delete_user(data, caller, db)
 
     elif action == "create":
         if "email" not in data:

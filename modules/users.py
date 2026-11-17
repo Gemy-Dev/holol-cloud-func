@@ -218,40 +218,6 @@ def set_user_active(data, caller, db):
     return jsonify({"success": True, "uid": uid, "isActive": is_active})
 
 
-def delete_user(data, caller, db):
-    """Delete a user from Firebase Auth, then from Firestore.
-
-    The document is removed only once the sign-in account is gone. Deleting the
-    document alone used to leave an account that could still sign in.
-    """
-    uid = data.get("uid") or data.get("id")
-    if not uid:
-        return jsonify({"error": "uid is required"}), 400
-    if uid == caller.uid:
-        return jsonify({"error": "You cannot delete your own account"}), 400
-
-    try:
-        auth.delete_user(uid)
-    except auth.UserNotFoundError:
-        pass
-    except Exception as auth_error:
-        print(f"delete_user: Auth deletion failed for {uid}: {auth_error}")
-        return jsonify({"error": "Failed to delete the sign-in account", "uid": uid}), 500
-
-    try:
-        db.collection("users").document(uid).delete()
-    except Exception as db_error:
-        print(f"delete_user: Firestore deletion failed for {uid}: {db_error}")
-        return jsonify({"error": "Sign-in account deleted, but the user record was not", "uid": uid}), 500
-
-    return jsonify({
-        "success": True,
-        "message": "User deleted from both Firebase Auth and Firestore",
-        "uid": uid
-    })
-
-
-
 # The notification preference exists under two spellings in production. The
 # dashboard writes the correctly spelled key; the field app has always read the
 # misspelled one. Renaming the *stored* key is deliberately not part of this
