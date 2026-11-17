@@ -158,6 +158,7 @@ ACTION_REQUIREMENTS = {
     "sendNotification": (ACTIVE,),
     "sendNotificationToAll": (ACTIVE,),
     "sendReviewNotification": (ACTIVE,),
+    "notifyReviewDecision": (ACTIVE,),
     "sendEmail": (ACTIVE,),
     "notifyReportDeleted": (ACTIVE,),
     "sendDailyReport": (ACTIVE,),

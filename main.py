@@ -62,7 +62,7 @@ from modules.apk_manager import (
 )
 from modules.opportunities import get_opportunity_stats
 from modules.review_reminders import handle_report_saved
-from modules.business_notifications import handle_business_notification
+from modules.business_notifications import handle_business_notification, handle_review_decision
 from modules.review_emails import send_report_deleted_email
 from modules.role_reminders import handle_role_reminders
 from modules.special_requests import (
@@ -261,6 +261,10 @@ def route_request(action, data, request):
     
     elif action == "sendNotificationToAll":
         return handle_send_notification_to_all(decoded_token, data, db)
+
+    elif action == "notifyReviewDecision":
+        # REV-01: the owner of an accepted or rejected record.
+        return handle_review_decision(decoded_token, data, db)
 
     elif action == "sendReviewNotification":
         # Spec 2035 US4: the representative plus holders of the other

@@ -200,3 +200,96 @@ def handle_business_notification(decoded_token, data, db):
     if result is None:
         return jsonify({'success': False, 'reason': 'source_not_synced'}), 409
     return jsonify({'success': True, **result}), 200
+
+
+# ------------------------------------------------------------ review decisions
+
+# Per reviewable collection: the field holding the decision, what the record
+# is called, and the navigation the notice opens.
+REVIEW_DECISIONS = {
+    'clients': ('state', 'العميل', lambda rid: {'action': 'open_client', 'clientId': rid}),
+    'tasks': ('reviewState', 'النشاط', lambda rid: {'action': 'open_task', 'taskId': rid}),
+    'main_opportunities': ('reviewState', 'الفرصة',
+                           lambda rid: {'action': 'open_main_opportunity',
+                                        'mainOpportunityId': rid}),
+}
+_REVIEWER_ROLES = ('admin', 'salesManager')
+
+
+def _decision(record, field):
+    """'approved', 'rejected', or None while undecided.
+
+    A rejection is stored as `deleted` like a removal; only a removal carries
+    `deletedAt`, so the two are told apart by it.
+    """
+    value = record.get(field)
+    if value == 'approved':
+        return 'approved'
+    if value == 'deleted' and not record.get('deletedAt'):
+        return 'rejected'
+    return None
+
+
+def _owners(collection, record):
+    if collection == 'clients':
+        ids = [record.get('creatorId')]
+    elif collection == 'tasks':
+        ids = [record.get('assignedToId')]
+    else:
+        ids = list(record.get('salesRepresentativeIds') or [record.get('salesRepresentativeId')])
+    return [i for i in dict.fromkeys(ids) if isinstance(i, str) and i]
+
+
+def handle_review_decision(decoded_token, data, db):
+    """Tell a record's owner it was accepted or rejected (REV-01).
+
+    Only the record is taken from the caller. The decision, the owner and
+    the reason are read from Firestore, so a notice is only ever sent for a
+    decision that was really recorded, and to the person it concerns. Each
+    decision is announced once.
+    """
+    collection = data.get('collection')
+    spec = REVIEW_DECISIONS.get(collection)
+    if spec is None:
+        return jsonify({'success': False, 'error': 'invalid_collection'}), 400
+    field, label, route_for = spec
+
+    actor_id = decoded_token.get('uid')
+    actor = _read(db, 'users', actor_id) or {}
+    if actor.get('isActive') is False or role_of(actor) not in _REVIEWER_ROLES:
+        return jsonify({'success': False, 'error': 'not_a_reviewer'}), 403
+
+    record_id = data.get('recordId')
+    record = _read(db, collection, record_id)
+    if record is None:
+        return jsonify({'success': False, 'error': 'not_found'}), 404
+    decision = _decision(record, field)
+    if decision is None:
+        return jsonify({'success': True, 'skipped': 'not_decided'}), 200
+
+    owners = [o for o in _owners(collection, record) if o != actor_id]
+    if not owners:
+        return jsonify({'success': True, 'skipped': 'no_owner'}), 200
+
+    name = record.get('name') or record.get('title') or ''
+    lines = [f'{label}: {name}'] if name else []
+    if decision == 'rejected':
+        reason = record.get('cancelReason') or record.get('rejectionReason')
+        if reason:
+            lines.append(f'السبب: {reason}')
+    title = f"تم {'قبول' if decision == 'approved' else 'رفض'} {label}"
+    route = {**route_for(record_id), 'event': 'review_decision'}
+
+    totals = {'successCount': 0, 'failureCount': 0, 'unreachable': []}
+    for owner in owners:
+        result = n.send_to_user(
+            db, user_id=owner, title=title, body='\n'.join(lines) or title,
+            message_data=route, kind='review_decision',
+            source=notification_log.request_source(data), actor_id=actor_id,
+            notification_id=f'review_decision-{collection}-{record_id}-{decision}-{owner}',
+            create_only=True,
+        )
+        totals['successCount'] += result.get('successCount', 0)
+        totals['failureCount'] += result.get('failureCount', 0)
+        totals['unreachable'].extend(result.get('unreachable', []))
+    return jsonify({'success': True, 'decision': decision, **totals}), 200
