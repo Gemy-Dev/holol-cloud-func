@@ -117,6 +117,8 @@ ACTION_REQUIREMENTS = {
 
     # Clients, plans and the tasks generated from them.
     "deleteClient": ("deleteClient",),
+    # Removing a client for good is the review centre's permanent delete.
+    "purgeClient": ("purgeDeletedRecord",),
     "createPlanTasks": ("addPlan", "updatePlan"),
     "updatePlanTasks": ("updatePlan",),
     "createTasksFromProduct": ("addPlan", "updatePlan"),

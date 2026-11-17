@@ -17,7 +17,13 @@ from modules.users import (
     set_user_active,
     migrate_notification_preference,
 )
-from modules.products import get_products, get_plan_products, get_clients, delete_client_and_tasks
+from modules.products import (
+    get_products,
+    get_plan_products,
+    get_clients,
+    delete_client_and_tasks,
+    purge_client,
+)
 from modules.tasks import (
     create_plan_tasks,
     regenerate_plan_tasks,
@@ -191,6 +197,9 @@ def route_request(action, data, request):
     
     elif action == "deleteClient":
         return delete_client_and_tasks(data, decoded_token, db)
+
+    elif action == "purgeClient":
+        return purge_client(data, decoded_token, db)
 
     elif action == "createPlanTasks":
         return create_plan_tasks(data, db)

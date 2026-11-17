@@ -80,16 +80,18 @@ class _FakeDocRef:
 
     def get(self, transaction=None):
         doc = self._store.get(self._collection, {}).get(self._doc_id)
-        return _FakeDocSnapshot(self._doc_id, doc)
+        return _FakeDocSnapshot(self._doc_id, doc, self)
 
     def delete(self):
         self._store.setdefault(self._collection, {}).pop(self._doc_id, None)
 
 
 class _FakeDocSnapshot:
-    def __init__(self, doc_id: str, data: Optional[dict]):
+    def __init__(self, doc_id: str, data: Optional[dict], reference=None):
         self._doc_id = doc_id
         self._data = data
+        # Set for snapshots read from a collection or query, as Firestore's are.
+        self.reference = reference
 
     @property
     def id(self):
@@ -176,7 +178,7 @@ class _FakeCollection:
 
     def _all_docs(self) -> list:
         return [
-            _FakeDocSnapshot(did, dict(data))
+            _FakeDocSnapshot(did, dict(data), _FakeDocRef(self._store, self._name, did))
             for did, data in self._store.get(self._name, {}).items()
         ]
 

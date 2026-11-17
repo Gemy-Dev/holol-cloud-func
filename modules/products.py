@@ -1,6 +1,8 @@
 """Products and clients data module."""
 from flask import jsonify
 
+from modules.dates import now_iso
+
 
 def get_products(decoded_token, db):
     """Get all products with expanded relationships"""
@@ -188,52 +190,123 @@ def get_clients(decoded_token, db):
         return jsonify({"error": error_msg}), 500
 
 
+# Tags a task that was soft-deleted because its client was, so a restore
+# brings back exactly those (the dashboard reads the same key).
+DELETED_WITH_CLIENT_KEY = "deletedWithClient"
+
+# Firestore caps a batch at 500 writes.
+_CLIENT_BATCH_SIZE = 400
+
+
+def _commit_in_batches(db, writes):
+    """Apply (kind, ref, data) writes in awaited batches."""
+    for start in range(0, len(writes), _CLIENT_BATCH_SIZE):
+        batch = db.batch()
+        for kind, ref, payload in writes[start:start + _CLIENT_BATCH_SIZE]:
+            if kind == "delete":
+                batch.delete(ref)
+            else:
+                batch.update(ref, payload)
+        batch.commit()
+
+
 def delete_client_and_tasks(data, decoded_token, db):
-    """Delete a client and all tasks associated with that client."""
+    """Move a client, and its tasks that hold no fieldwork, to the bin.
+
+    Deleting a client used to remove it and every one of its tasks for good,
+    completed visits included (SEC-06). Now the client is soft-deleted
+    (`state: deleted`, with the state to restore and who deleted it when),
+    and its tasks without fieldwork are soft-deleted with it and tagged
+    `deletedWithClient`. Completed tasks and tasks carrying a visit result
+    are left untouched, as are tasks already deleted on their own. Removing
+    for good is `purge_client`, from the review centre.
+    """
+    from modules.tasks import _task_is_protected
+
     client_id = data.get("clientId") or data.get("id")
     if not client_id:
         return jsonify({"error": "clientId is required"}), 400
-
     client_id = str(client_id)
 
     try:
         client_ref = db.collection("clients").document(client_id)
         client_doc = client_ref.get()
-
         if not client_doc.exists:
             return jsonify({"error": "Client not found"}), 404
+        client = client_doc.to_dict() or {}
+        if client.get("state") == "deleted":
+            return jsonify({"success": True, "clientId": client_id, "tasksRetired": 0})
 
-        tasks_query = db.collection("tasks").where("clientId", "==", client_id)
-        tasks_deleted = 0
-        batch = db.batch()
-        writes_in_batch = 0
-
-        def commit_batch(current_batch, pending_ops):
-            if pending_ops == 0:
-                return current_batch, pending_ops
-            current_batch.commit()
-            return db.batch(), 0
-
-        for task_doc in tasks_query.stream():
-            batch.delete(task_doc.reference)
-            tasks_deleted += 1
-            writes_in_batch += 1
-
-            if writes_in_batch == 450:
-                batch, writes_in_batch = commit_batch(batch, writes_in_batch)
-
-        # Delete the client after removing its tasks
-        batch.delete(client_ref)
-        writes_in_batch += 1
-        batch, writes_in_batch = commit_batch(batch, writes_in_batch)
+        now = now_iso()
+        by = decoded_token.get("uid")
+        writes = []
+        for task_doc in db.collection("tasks").where("clientId", "==", client_id).stream():
+            task = task_doc.to_dict() or {}
+            if _task_is_protected(task) or task.get("reviewState") == "deleted":
+                continue
+            writes.append(("update", task_doc.reference, {
+                "reviewState": "deleted",
+                "previousReviewState": task.get("reviewState"),
+                "deletedAt": now,
+                "deletedBy": by,
+                "updatedAt": now,
+                DELETED_WITH_CLIENT_KEY: client_id,
+            }))
+        # The client goes last, so a failed attempt leaves it to be retried;
+        # tasks already retired are skipped the second time.
+        writes.append(("update", client_ref, {
+            "state": "deleted",
+            "previousReviewState": client.get("state"),
+            "deletedAt": now,
+            "deletedBy": by,
+            "updatedAt": now,
+        }))
+        _commit_in_batches(db, writes)
 
         return jsonify({
             "success": True,
             "clientId": client_id,
-            "tasksDeleted": tasks_deleted
+            "tasksRetired": len(writes) - 1,
         })
     except Exception as e:
-        error_msg = f"Failed to delete client {client_id}: {str(e)}"
-        print(error_msg)
-        return jsonify({"error": error_msg}), 500
+        print(f"delete_client_and_tasks: failed for {client_id}: {e}")
+        return jsonify({"error": "Failed to delete client"}), 500
 
+
+def purge_client(data, decoded_token, db):
+    """Remove a client in the bin for good, with the tasks retired with it.
+
+    Only a client already soft-deleted is removed, and only the review
+    centre calls this (gated on `purgeDeletedRecord`). Tasks that held
+    fieldwork were never retired with the client, so they stay.
+    """
+    client_id = data.get("clientId") or data.get("id")
+    if not client_id:
+        return jsonify({"error": "clientId is required"}), 400
+    client_id = str(client_id)
+
+    try:
+        client_ref = db.collection("clients").document(client_id)
+        client_doc = client_ref.get()
+        if not client_doc.exists:
+            return jsonify({"error": "Client not found"}), 404
+        if (client_doc.to_dict() or {}).get("state") != "deleted":
+            return jsonify({"error": "Only a deleted client can be removed for good"}), 409
+
+        writes = [
+            ("delete", task_doc.reference, None)
+            for task_doc in db.collection("tasks")
+            .where(DELETED_WITH_CLIENT_KEY, "==", client_id)
+            .stream()
+        ]
+        writes.append(("delete", client_ref, None))
+        _commit_in_batches(db, writes)
+
+        return jsonify({
+            "success": True,
+            "clientId": client_id,
+            "tasksDeleted": len(writes) - 1,
+        })
+    except Exception as e:
+        print(f"purge_client: failed for {client_id}: {e}")
+        return jsonify({"error": "Failed to delete client"}), 500
