@@ -208,8 +208,9 @@ def route_request(action, data, request):
         return create_plan_tasks(data, db)
 
     elif action == "updatePlanTasks":
-        # Plan was edited: wipe non-protected tasks and rebuild from new data
-        return regenerate_plan_tasks(data, db)
+        # Plan was edited: tasks it no longer targets go to the bin, and the
+        # combinations nothing covers are created.
+        return regenerate_plan_tasks(data, db, actor_id=decoded_token.get("uid"))
 
     elif action == "syncTasksForClient":
         return reconcile_client_tasks(data, db)

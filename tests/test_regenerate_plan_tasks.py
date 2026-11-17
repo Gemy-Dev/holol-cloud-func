@@ -2,6 +2,7 @@
 from unittest.mock import patch
 
 from tests.conftest import (
+    DELETE_FIELD,
     FakeFirestore,
     make_client,
     make_influencer_doctor,
@@ -13,11 +14,12 @@ from tests.conftest import (
 from modules.tasks import regenerate_plan_tasks
 
 
-def _call(db, plan_data):
+def _call(db, plan_data, actor_id=None):
     with patch("modules.tasks.firestore") as mock_fs:
         mock_fs.SERVER_TIMESTAMP = "SERVER_TIMESTAMP"
         mock_fs.ArrayUnion = lambda x: x
-        response = regenerate_plan_tasks({"plan": plan_data}, db)
+        mock_fs.DELETE_FIELD = DELETE_FIELD
+        response = regenerate_plan_tasks({"plan": plan_data}, db, actor_id=actor_id)
     if isinstance(response, tuple):
         resp_obj, status = response
     else:
@@ -27,6 +29,15 @@ def _call(db, plan_data):
 
 def _tasks(db):
     return db._get_all("tasks")
+
+
+def _live(db):
+    """The plan's tasks outside the review centre's bin."""
+    return {k: v for k, v in _tasks(db).items() if v.get("reviewState") != "deleted"}
+
+
+def _binned_by_edit(task):
+    return task.get("reviewState") == "deleted" and task.get("removedFromPlan") == "plan1"
 
 
 def _seed_single_client_plan(db, *, products=('prod1', 'prod2'), tasks=None):
@@ -58,7 +69,7 @@ def _plan_with_products(*product_ids, cities=None):
 class TestRemovedProduct:
     """A product dropped from the plan takes its pending tasks with it."""
 
-    def test_pending_task_for_removed_product_is_deleted_and_not_recreated(self, db: FakeFirestore):
+    def test_pending_task_for_removed_product_is_binned_and_not_recreated(self, db: FakeFirestore):
         _seed_single_client_plan(db, tasks=[
             make_task('t1', product_id='prod1'),
             make_task('t2', product_id='prod2'),
@@ -74,11 +85,13 @@ class TestRemovedProduct:
         assert body['tasksKept'] == 1
         assert body['tasksProtected'] == 0
 
-        remaining = _tasks(db)
+        remaining = _live(db)
         # The surviving task is the original document, not a recreation
         assert list(remaining) == ['t1']
         assert remaining['t1']['productId'] == 'prod1'
         assert remaining['t1']['status'] == 'pending'
+        # The removed product's task is in the bin, not gone.
+        assert _binned_by_edit(_tasks(db)['t2'])
 
     def test_completed_task_for_removed_product_survives(self, db: FakeFirestore):
         _seed_single_client_plan(db, products=('prod1', 'prod2'), tasks=[
@@ -94,11 +107,12 @@ class TestRemovedProduct:
         assert body['tasksDeleted'] == 1
         assert body['tasksCreated'] == 0
 
-        remaining = _tasks(db)
+        remaining = _live(db)
         assert set(remaining) == {'t1', 't2'}
         assert remaining['t2']['status'] == 'completed'
+        assert _binned_by_edit(_tasks(db)['t3'])
 
-    def test_canceled_task_for_removed_product_is_deleted(self, db: FakeFirestore):
+    def test_canceled_task_for_removed_product_is_binned(self, db: FakeFirestore):
         _seed_single_client_plan(db, tasks=[
             make_task('t1', product_id='prod2', status='canceled'),
         ])
@@ -106,7 +120,7 @@ class TestRemovedProduct:
         body, _ = _call(db, _plan_with_products('prod1'))
 
         assert body['tasksDeleted'] == 1
-        assert 't1' not in _tasks(db)
+        assert _binned_by_edit(_tasks(db)['t1'])
 
 
 class TestProtectedTasks:
@@ -239,7 +253,8 @@ class TestAdditiveEdits:
         assert body['tasksKept'] == 1
         assert body['tasksDeleted'] == 1
         assert body['tasksCreated'] == 0
-        assert len(_tasks(db)) == 1
+        assert len(_live(db)) == 1
+        assert len(_tasks(db)) == 2
 
 
 class TestPlanCounters:
@@ -309,3 +324,52 @@ class TestValidation:
         assert status == 400
         assert body['success'] is False
         assert list(_tasks(db)) == ['t1']
+
+
+class TestTheBin:
+    """A plan edit never removes anything for good, and undoes itself."""
+
+    def test_a_binned_task_records_who_and_what_it_was(self, db: FakeFirestore):
+        _seed_single_client_plan(db, tasks=[make_task('t2', product_id='prod2')])
+
+        _call(db, _plan_with_products('prod1'), actor_id='admin1')
+
+        task = _tasks(db)['t2']
+        assert _binned_by_edit(task)
+        assert task['deletedBy'] == 'admin1'
+        assert task['deletedAt']
+
+    def test_targeting_it_again_brings_the_same_task_back(self, db: FakeFirestore):
+        _seed_single_client_plan(db, tasks=[
+            make_task('t1', product_id='prod1'),
+            {**make_task('t2', product_id='prod2'), 'targetDate': '2026-12-01T00:00:00.000'},
+        ])
+        _call(db, _plan_with_products('prod1'))
+
+        body, _ = _call(db, _plan_with_products('prod1', 'prod2'))
+
+        assert body['tasksRestored'] == 1
+        assert body['tasksCreated'] == 0
+        task = _tasks(db)['t2']
+        assert task.get('reviewState') != 'deleted'
+        assert 'removedFromPlan' not in task and 'deletedAt' not in task
+        assert task['targetDate'] == '2026-12-01T00:00:00.000'
+
+    def test_a_task_deleted_by_hand_stays_deleted_and_is_not_recreated(self, db: FakeFirestore):
+        _seed_single_client_plan(db, tasks=[
+            {**make_task('t1', product_id='prod1'), 'reviewState': 'deleted'},
+        ])
+
+        body, _ = _call(db, _plan_with_products('prod1'))
+
+        assert body['tasksCreated'] == 0 and body['tasksRestored'] == 0
+        assert _tasks(db)['t1']['reviewState'] == 'deleted'
+
+    def test_nothing_in_the_bin_is_removed(self, db: FakeFirestore):
+        _seed_single_client_plan(db, tasks=[
+            {**make_task('t9', product_id='prod2'), 'reviewState': 'deleted'},
+        ])
+
+        _call(db, _plan_with_products('prod1'))
+
+        assert 't9' in _tasks(db)

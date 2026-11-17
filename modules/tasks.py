@@ -757,7 +757,26 @@ def create_plan_tasks(data, db):
         }), 400
 
 
-def regenerate_plan_tasks(data, db):
+def _restore_fields(task, now):
+    """What brings a task binned by a plan edit back as it was."""
+    DELETE_FIELD = firestore.DELETE_FIELD
+    return {
+        "reviewState": task.get("previousReviewState") or "approved",
+        "previousReviewState": DELETE_FIELD,
+        "deletedAt": DELETE_FIELD,
+        "deletedBy": DELETE_FIELD,
+        REMOVED_FROM_PLAN_KEY: DELETE_FIELD,
+        "updatedAt": now,
+    }
+
+
+# Tags a task binned because an edit of its plan no longer targets it, with
+# the plan's id: a later edit that targets it again brings it back instead of
+# creating an empty copy.
+REMOVED_FROM_PLAN_KEY = "removedFromPlan"
+
+
+def regenerate_plan_tasks(data, db, actor_id=None):
     """Sync a plan's tasks with its edited targeting data.
 
     Called when a planner edits a plan (cities, departments or target
@@ -771,7 +790,13 @@ def regenerate_plan_tasks(data, db):
         Adding a product or a city therefore deletes nothing — it only
         creates the missing tasks, exactly like plan creation does.
       - Pending tasks whose combination no longer matches (a removed
-        product, city or department) are hard-deleted.
+        product, city or department) go to the review centre's bin, tagged
+        with the plan, never deleted for good: an edit made by mistake is
+        undone by restoring them, dates and notes included.
+      - A task already in the bin is never touched, except one an earlier
+        edit binned that the plan now targets again: it is brought back as
+        it was, rather than replaced by a new, empty task. A task someone
+        deleted on purpose stays deleted and is not recreated.
       - Combinations not covered by any existing task are created with the
         same payload used at plan creation.
 
@@ -849,7 +874,10 @@ def regenerate_plan_tasks(data, db):
         protected_client_ids = set()
         protected_count = 0
         kept_count = 0
+        restored_count = 0
         doomed_refs = []
+        now = now_iso()
+        update_ops = []
 
         for task_doc in db.collection("tasks").where("planId", "==", plan_id).stream():
             task = task_doc.to_dict()
@@ -860,6 +888,18 @@ def regenerate_plan_tasks(data, db):
                 task.get("marketingTask"),
                 task.get("doctorName"),
             )
+            if task.get("reviewState") == "deleted":
+                # The bin is the review centre's: nothing here removes from it.
+                if key in desired and key not in covered_keys:
+                    covered_keys.add(key)
+                    if task.get(REMOVED_FROM_PLAN_KEY) == plan_id:
+                        update_ops.append((
+                            "update",
+                            db.collection("tasks").document(task_doc.id),
+                            _restore_fields(task, now),
+                        ))
+                        restored_count += 1
+                continue
             if _task_is_protected(task):
                 protected_count += 1
                 covered_keys.add(key)
@@ -873,11 +913,24 @@ def regenerate_plan_tasks(data, db):
                 covered_keys.add(key)
             else:
                 # The combination was removed from the plan, or the task is a
-                # duplicate of one already kept.
-                doomed_refs.append(db.collection("tasks").document(task_doc.id))
+                # duplicate of one already kept: to the bin.
+                doomed_refs.append((
+                    db.collection("tasks").document(task_doc.id),
+                    task.get("reviewState"),
+                ))
 
         # --- Phase 3: create only the combinations nothing covers yet ---
-        batch_ops = [("delete", ref, None) for ref in doomed_refs]
+        batch_ops = update_ops + [
+            ("update", ref, {
+                "reviewState": "deleted",
+                "previousReviewState": state,
+                "deletedAt": now,
+                "deletedBy": actor_id,
+                "updatedAt": now,
+                REMOVED_FROM_PLAN_KEY: plan_id,
+            })
+            for ref, state in doomed_refs
+        ]
         created_count = 0
 
         for key, (client, product, marketing_task_name, doctor) in desired.items():
@@ -901,8 +954,8 @@ def regenerate_plan_tasks(data, db):
             chunk = batch_ops[i:i + BATCH_LIMIT]
             batch = db.batch()
             for op, ref, op_data in chunk:
-                if op == "delete":
-                    batch.delete(ref)
+                if op == "update":
+                    batch.update(ref, op_data)
                 elif op == "set":
                     batch.set(ref, op_data)
             batch.commit()
@@ -916,7 +969,7 @@ def regenerate_plan_tasks(data, db):
             cid for cid in sorted(protected_client_ids) if cid not in matched_client_ids
         ]
         skipped_count = len(desired) - created_count
-        tasks_count = protected_count + kept_count + created_count
+        tasks_count = protected_count + kept_count + restored_count + created_count
         try:
             plan_ref = db.collection("plans").document(plan_id)
             plan_ref.update({
@@ -931,12 +984,15 @@ def regenerate_plan_tasks(data, db):
         return jsonify({
             "success": True,
             "message": (
-                f"Synced plan tasks: {len(doomed_refs)} deleted, "
+                f"Synced plan tasks: {len(doomed_refs)} binned, "
+                f"{restored_count} restored, "
                 f"{created_count} created, {kept_count} kept, "
                 f"{protected_count} protected"
             ),
             "planId": plan_id,
+            # Binned, not deleted: the key keeps its name for the dashboard.
             "tasksDeleted": len(doomed_refs),
+            "tasksRestored": restored_count,
             "tasksProtected": protected_count,
             "tasksKept": kept_count,
             "tasksCreated": created_count,
