@@ -241,9 +241,10 @@ def send_email(title, body, db):
         try:
             recipient_emails = _fetch_email_recipients(db)
         except Exception as e:
+            print(f"❌ Failed to fetch email recipients: {e}")
             return jsonify({
                 "success": False,
-                "error": str(e)
+                "error": "Failed to fetch email recipients"
             }), 500
         
         # Check if any recipients found
@@ -352,8 +353,8 @@ def send_email(title, body, db):
             }), 500
         
     except Exception as e:
-        error_msg = f"Error sending email: {str(e)}"
-        print(f"❌ {error_msg}")
+        error_msg = "Error sending email"
+        print(f"❌ {error_msg}: {e}")
         print(traceback.format_exc())
         return jsonify({
             "success": False,
@@ -577,7 +578,8 @@ def send_daily_report(data, db):
             try:
                 recipients = _fetch_recipients_by_permission(db, report_permission)
             except Exception as e:
-                return jsonify({"success": False, "error": str(e)}), 500
+                print(f"❌ Failed to fetch email recipients: {e}")
+                return jsonify({"success": False, "error": "Failed to fetch email recipients"}), 500
 
         if not recipients:
             return jsonify({
@@ -639,8 +641,8 @@ def send_daily_report(data, db):
             }), 500
 
     except Exception as e:
-        error_msg = f"Error sending daily report: {str(e)}"
-        print(f"{error_msg}")
+        error_msg = "Error sending daily report"
+        print(f"❌ {error_msg}: {e}")
         print(traceback.format_exc())
         return jsonify({"success": False, "error": error_msg}), 500
 
@@ -704,7 +706,8 @@ def notify_new_deal(data, db):
         try:
             recipients = _fetch_recipients_by_permission(db, "receiveOrders")
         except Exception as e:
-            return jsonify({"success": False, "error": str(e)}), 500
+            print(f"❌ Failed to fetch email recipients: {e}")
+            return jsonify({"success": False, "error": "Failed to fetch email recipients"}), 500
 
         if not recipients:
             return jsonify({
@@ -805,8 +808,8 @@ def notify_new_deal(data, db):
             }), 500
 
     except Exception as e:
-        error_msg = f"Error sending deal notification: {str(e)}"
-        print(f"{error_msg}")
+        error_msg = "Error sending deal notification"
+        print(f"❌ {error_msg}: {e}")
         print(traceback.format_exc())
         return jsonify({"success": False, "error": error_msg}), 500
 
@@ -917,8 +920,8 @@ def send_support_visit_report(data, db):
             }), 500
 
     except Exception as e:
-        error_msg = f"Error sending support visit report: {str(e)}"
-        print(f"{error_msg}")
+        error_msg = "Error sending support visit report"
+        print(f"❌ {error_msg}: {e}")
         print(traceback.format_exc())
         return jsonify({"success": False, "error": error_msg}), 500
 

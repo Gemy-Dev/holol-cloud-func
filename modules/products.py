@@ -184,8 +184,8 @@ def get_clients(decoded_token, db):
         return jsonify(clients)
     except Exception as e:
         import traceback
-        error_msg = f"Error in get_clients: {str(e)}"
-        print(error_msg)
+        error_msg = "Error in get_clients"
+        print(f"❌ {error_msg}: {e}")
         print(traceback.format_exc())
         return jsonify({"error": error_msg}), 500
 

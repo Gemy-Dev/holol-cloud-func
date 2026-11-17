@@ -260,8 +260,8 @@ def handle_send_notification(decoded_token, data, db):
         }), 200
 
     except Exception as e:
-        error_msg = f"Error sending notification: {str(e)}"
-        print(f"❌ {error_msg}")
+        error_msg = "Error sending notification"
+        print(f"❌ {error_msg}: {e}")
         print(traceback.format_exc())
         notification_log.record_delivery(
             db, notification_id, success_count=0, failure_count=1, reason="error"
@@ -545,8 +545,8 @@ def handle_send_notification_to_all(decoded_token, data, db):
             }), 500
             
     except Exception as e:
-        error_msg = f"Error sending notification to all: {str(e)}"
-        print(error_msg)
+        error_msg = "Error sending notification to all"
+        print(f"❌ {error_msg}: {e}")
         print(traceback.format_exc())
         return jsonify({
             "success": False,
@@ -829,8 +829,8 @@ def handle_send_review_notification(decoded_token, data, db):
         }), 200
 
     except Exception as e:
-        error_msg = f"Error sending review notification: {str(e)}"
-        print(error_msg)
+        error_msg = "Error sending review notification"
+        print(f"❌ {error_msg}: {e}")
         print(traceback.format_exc())
         return jsonify({
             "success": False,

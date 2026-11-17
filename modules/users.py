@@ -389,6 +389,6 @@ def migrate_notification_preference(data, decoded_token, db):
         }), 200
 
     except Exception as e:
-        error_msg = f"Error migrating notification preference: {str(e)}"
-        print(f"❌ {error_msg}")
+        error_msg = "Error migrating notification preference"
+        print(f"❌ {error_msg}: {e}")
         return jsonify({"success": False, "error": error_msg}), 500

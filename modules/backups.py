@@ -103,17 +103,6 @@ def _validate_and_prepare_backup_structure(extracted_dir: str):
     return None
 
 
-def _make_blob_public_temporarily(blob):
-    """Make a blob publicly readable and return its public URL."""
-    try:
-        # Make the blob publicly readable
-        blob.make_public()
-        return blob.public_url
-    except Exception as e:
-        print(f"⚠️  Failed to make blob public: {str(e)}")
-        raise
-
-
 def handle_manual_backup(decoded_token):
     """Handle manual backup trigger"""
     try:
@@ -138,9 +127,10 @@ def handle_manual_backup(decoded_token):
         })
         
     except Exception as e:
+        print(f"❌ Backup operation failed: {e}")
         return jsonify({
             "success": False,
-            "error": f"Backup operation failed: {str(e)}",
+            "error": "Backup operation failed",
             "timestamp": get_iraq_time().isoformat()
         }), 500
 
@@ -220,9 +210,10 @@ def handle_backup_status(decoded_token):
         })
         
     except Exception as e:
+        print(f"❌ Failed to get backup status: {e}")
         return jsonify({
             "success": False,
-            "error": f"Failed to get backup status: {str(e)}",
+            "error": "Failed to get backup status",
             "timestamp": get_iraq_time().isoformat()
         }), 500
 
@@ -284,8 +275,9 @@ def handle_list_backups(decoded_token):
         })
         
     except Exception as e:
+        print(f"❌ Failed to list backups: {e}")
         return jsonify({
-            "error": f"Failed to list backups: {str(e)}",
+            "error": "Failed to list backups",
             "success": False,
             "timestamp": get_iraq_time().isoformat()
         }), 500
@@ -357,7 +349,8 @@ def handle_delete_backup(decoded_token, data, db):
                 deleted_size += file_size
                 print(f"  ✓ Deleted: {blob.name}")
             except Exception as e:
-                error_msg = f"Failed to delete {blob.name}: {str(e)}"
+                error_msg = f"Failed to delete {blob.name}"
+                print(f"❌ {error_msg}: {e}")
                 errors.append(error_msg)
                 print(f"  ✗ {error_msg}")
 
@@ -387,8 +380,8 @@ def handle_delete_backup(decoded_token, data, db):
         })
 
     except Exception as e:
-        error_msg = f"Failed to delete backup: {str(e)}"
-        print(f"❌ {error_msg}")
+        error_msg = "Failed to delete backup"
+        print(f"❌ {error_msg}: {e}")
         print(traceback.format_exc())
         return jsonify({
             "success": False,
@@ -482,8 +475,8 @@ def handle_download_backup_archive(decoded_token, data):
             "sizeBytes": len(archive_bytes)
         })
     except Exception as e:
-        error_msg = f"Failed to download backup archive: {str(e)}"
-        print(error_msg)
+        error_msg = "Failed to download backup archive"
+        print(f"❌ {error_msg}: {e}")
         return jsonify({
             "success": False,
             "error": error_msg
@@ -545,7 +538,7 @@ def get_restore_status_direct(firestore_service, operation_name: str):
             "done": False,
             "metadata": {},
             "status": "error",
-            "error": f"Cannot check status: {str(e)}"
+            "error": "Cannot check status"
         }
 
 
@@ -616,7 +609,7 @@ def handle_restore_backup(decoded_token, data):
     except Exception as e:
         print(f"❌ General error in handle_restore_backup: {str(e)}")
         return jsonify({
-            "error": f"Failed to restore backup: {str(e)}",
+            "error": "Failed to restore backup",
             "success": False,
             "timestamp": get_iraq_time().isoformat()
         }), 500
@@ -752,8 +745,8 @@ def handle_upload_backup_archive(decoded_token, data):
         return jsonify(response)
         
     except Exception as e:
-        error_msg = f"Failed to upload backup archive: {str(e)}"
-        print(error_msg)
+        error_msg = "Failed to upload backup archive"
+        print(f"❌ {error_msg}: {e}")
         print(traceback.format_exc())
         return jsonify({
             "success": False,
@@ -1029,7 +1022,7 @@ def handle_restore_status(decoded_token, data):
     except Exception as e:
         print(f"❌ Handle restore status error: {str(e)}")
         return jsonify({
-            "error": f"Failed to check restore status: {str(e)}",
+            "error": "Failed to check restore status",
             "success": False,
             "timestamp": get_iraq_time().isoformat()
         }), 500

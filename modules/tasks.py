@@ -1230,8 +1230,8 @@ def reconcile_client_tasks(data, db):
         })
 
     except Exception as e:
-        error_msg = f"Failed to reconcile tasks for client: {str(e)}"
-        print(error_msg)
+        error_msg = "Failed to reconcile tasks for client"
+        print(f"❌ {error_msg}: {e}")
         print(traceback.format_exc())
         return jsonify({
             "error": error_msg,
@@ -1487,8 +1487,8 @@ def create_tasks_for_new_client(data, db):
         return jsonify(response)
     
     except Exception as e:
-        error_msg = f"Failed to create tasks for new client: {str(e)}"
-        print(error_msg)
+        error_msg = "Failed to create tasks for new client"
+        print(f"❌ {error_msg}: {e}")
         print(traceback.format_exc())
         return jsonify({
             "error": error_msg,
@@ -1797,8 +1797,8 @@ def create_tasks_from_product(data, db):
         return jsonify(response)
     
     except Exception as e:
-        error_msg = f"Failed to create tasks from product: {str(e)}"
-        print(error_msg)
+        error_msg = "Failed to create tasks from product"
+        print(f"❌ {error_msg}: {e}")
         print(traceback.format_exc())
         return jsonify({
             "error": error_msg,
@@ -1896,7 +1896,7 @@ def get_task_stats(decoded_token, db):
         # trace = traceback.format_exc()
         # print(trace)
         return jsonify({
-            "error": f"Failed to get stats: {str(e)}",
+            "error": "Failed to get stats",
             "success": False
         }), 500
 
@@ -1980,7 +1980,7 @@ def get_all_tasks_stats(db):
         # trace = traceback.format_exc()
         # print(trace)
         return jsonify({
-            "error": f"Failed to get stats: {str(e)}",
+            "error": "Failed to get stats",
             "success": False
         }), 500
 
@@ -2058,7 +2058,7 @@ def get_completed_tasks_status(db):
     except Exception as e:
         print(f"Error getting completed tasks status: {str(e)}")
         return jsonify({
-            "error": f"Failed to get completed tasks status: {str(e)}",
+            "error": "Failed to get completed tasks status",
             "success": False
         }), 500
 
@@ -2207,7 +2207,7 @@ def get_tasks_by_date_range(data, decoded_token, db):
     except Exception as e:
         print(f"Error getting tasks in range: {str(e)}")
         return jsonify({
-            "error": f"Failed to get tasks: {str(e)}",
+            "error": "Failed to get tasks",
             "success": False
         }), 500
 
@@ -2453,7 +2453,7 @@ def get_tasks_paginated(data, db):
         print(f"Error in get_tasks_paginated: {str(e)}")
         traceback.print_exc()
         return jsonify({
-            "error": f"Failed to get tasks: {str(e)}",
+            "error": "Failed to get tasks",
             "success": False
         }), 500
 

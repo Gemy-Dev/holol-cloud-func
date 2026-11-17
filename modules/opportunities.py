@@ -48,6 +48,6 @@ def get_opportunity_stats(db):
         print(f"Error getting opportunity stats: {str(e)}")
         print(traceback.format_exc())
         return jsonify({
-            "error": f"Failed to get opportunity stats: {str(e)}",
+            "error": "Failed to get opportunity stats",
             "success": False
         }), 500
