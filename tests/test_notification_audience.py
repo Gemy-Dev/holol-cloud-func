@@ -1,3 +1,4 @@
+import pytest
 """Tests for US2: a notification reaches exactly the configured audience.
 
 The fan-out used to stream the whole ``users`` collection and send to every
@@ -20,6 +21,16 @@ from unittest.mock import MagicMock, patch
 
 from tests.conftest import FakeFirestore
 from modules.notifications import handle_send_notification_to_all
+
+
+@pytest.fixture(autouse=True)
+def _sender_may_broadcast_to_all(monkeypatch):
+    """These cases are about the audience of a broadcast to everyone, which
+    is the `sendNotification` grant's (SEC-10); the sender here holds it.
+    test_notification_audience.py covers a sender without it."""
+    from modules import notifications
+
+    monkeypatch.setattr(notifications, "_may_broadcast_to_all", lambda db, uid: True)
 
 
 class _FakeSendResponse:

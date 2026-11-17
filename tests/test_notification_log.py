@@ -1,3 +1,4 @@
+import pytest
 """Tests for spec 2037: every notification sent is stored in `notifications`.
 
 The field app, the dashboard and Cloud Scheduler all send through this
@@ -21,6 +22,16 @@ from modules.notifications import (
 )
 from modules.apk_manager import _send_notifications_to_android_users
 from tests.conftest import is_contract_iso
+
+
+@pytest.fixture(autouse=True)
+def _sender_may_broadcast_to_all(monkeypatch):
+    """These cases are about the audience of a broadcast to everyone, which
+    is the `sendNotification` grant's (SEC-10); the sender here holds it.
+    test_notification_audience.py covers a sender without it."""
+    from modules import notifications
+
+    monkeypatch.setattr(notifications, "_may_broadcast_to_all", lambda db, uid: True)
 
 
 class _FakeSendResponse:

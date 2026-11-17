@@ -433,6 +433,13 @@ def handle_send_notification_to_all(decoded_token, data, db):
                 or _disabled_business_route(message_data)):
             return jsonify({'success': True, 'skipped': 'event_disabled'}), 200
 
+        # SEC-10: a free-form broadcast to everyone is the `sendNotification`
+        # grant's. Anyone else's — the field app announces deals, transfers and
+        # support problems this way, prices and descriptions included — goes to
+        # the managers only, so no account can push arbitrary text to every
+        # user and a deal's value no longer reaches every representative.
+        managers_only = not _may_broadcast_to_all(db, sender_id)
+
         # The audience, per data-model.md §2. The preference and the active
         # flag are a composite Firestore query; excluding the sender and
         # tokenless users is done here because Firestore cannot express
@@ -455,12 +462,17 @@ def handle_send_notification_to_all(decoded_token, data, db):
         # rejects can be traced back to the document holding it.
         tokens = []
         token_owners = []
+        recipient_ids = []
 
         for user_doc in audience.stream():
             # Skip the sender — they don't need their own notification
             if sender_id and user_doc.id == sender_id:
                 continue
-            fcm_token = (user_doc.to_dict() or {}).get("fcmToken")
+            user = user_doc.to_dict() or {}
+            if managers_only and user.get("role") not in _MANAGER_ROLE_SPELLINGS:
+                continue
+            recipient_ids.append(user_doc.id)
+            fcm_token = user.get("fcmToken")
             # Opted in but unregistered is not a delivery failure — they simply
             # have no device. SC-009 measures success against registered
             # devices, not against everyone opted in.
@@ -479,7 +491,7 @@ def handle_send_notification_to_all(decoded_token, data, db):
             kind="broadcast",
             source=notification_log.request_source(data),
             sender_id=sender_id,
-            recipient_ids=[notification_log.ALL],
+            recipient_ids=recipient_ids if managers_only else [notification_log.ALL],
         )
 
         if not tokens:
@@ -555,6 +567,23 @@ _ROLE_SPELLINGS = {
         "مدير المبيعات",
     ],
 }
+
+_MANAGER_ROLE_SPELLINGS = frozenset(
+    _ROLE_SPELLINGS["admin"] + _ROLE_SPELLINGS["salesManager"]
+)
+
+
+def _may_broadcast_to_all(db, sender_id):
+    """Whether ``sender_id`` holds the grant to notify every user."""
+    from modules.authz import Caller
+
+    if not sender_id:
+        return False
+    snapshot = db.collection("users").document(sender_id).get()
+    return Caller(sender_id, snapshot.to_dict() if snapshot.exists else {}).has(
+        "sendNotification"
+    )
+
 
 # A review signed in one slot is reported to the holders of the other role.
 _OTHER_REVIEWER_ROLE = {"salesManager": "admin", "admin": "salesManager"}
