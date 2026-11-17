@@ -111,6 +111,7 @@ ACTION_REQUIREMENTS = {
     "update": (SELF_OR, "updateUser"),
     "delete": ("deleteUser",),
     "setUserActive": ("updateUser",),
+    "setUserEmail": ("updateUser",),
     "resetPassword": ("updateUser",),
     "setPassword": (SELF_OR, "updateUser"),
     "migrateNotificationPreference": ("updateUser",),

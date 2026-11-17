@@ -486,3 +486,51 @@ def test_invalid_token_error_does_not_echo_the_exception():
     with patch.object(auth_module.auth, "verify_id_token", side_effect=ValueError("secret detail")):
         _, error, status = auth_module.verify_token(_request("bad"))
     assert status == 403 and "secret detail" not in str(error)
+
+
+# ------------------------------------------------------- WEB-15: e-mail
+
+def test_set_user_email_changes_auth_then_the_document(db):
+    from modules import users
+
+    _seed_user(db, "mgr", permissions=["updateUser"])
+    _seed_user(db, "rep", email="old@x.com")
+    with patch.object(users.auth, "update_user") as update:
+        body, status = _body(users.set_user_email(
+            {"uid": "rep", "email": " New@X.com "}, _caller(db, "mgr"), db))
+    assert status == 200 and body["email"] == "new@x.com"
+    update.assert_called_once_with("rep", email="new@x.com")
+    stored = db._get_all("users")["rep"]
+    assert stored["email"] == "new@x.com" and stored["updatedBy"] == "mgr"
+
+
+def test_set_user_email_keeps_the_document_when_auth_refuses(db):
+    from modules import users
+
+    _seed_user(db, "mgr", permissions=["updateUser"])
+    _seed_user(db, "rep", email="old@x.com")
+    taken = users.auth.EmailAlreadyExistsError("taken", None, None)
+    with patch.object(users.auth, "update_user", side_effect=taken):
+        _, status = _body(users.set_user_email(
+            {"uid": "rep", "email": "other@x.com"}, _caller(db, "mgr"), db))
+    assert status == 409
+    assert db._get_all("users")["rep"]["email"] == "old@x.com"
+
+
+def test_set_user_email_rejects_a_malformed_address(db):
+    from modules import users
+
+    _seed_user(db, "mgr", permissions=["updateUser"])
+    _seed_user(db, "rep", email="old@x.com")
+    with patch.object(users.auth, "update_user") as update:
+        _, status = _body(users.set_user_email(
+            {"uid": "rep", "email": "not-an-email"}, _caller(db, "mgr"), db))
+    assert status == 400
+    update.assert_not_called()
+
+
+def test_set_user_email_requires_update_user(db):
+    _seed_user(db, "rep", email="rep@x.com")
+    caller, error = authorize("setUserEmail", _request(), db,
+                              {"uid": "rep", "email": "me@x.com"}, _verify_ok("rep"))
+    assert caller is None and _status(error) == 403

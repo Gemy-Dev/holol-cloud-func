@@ -15,6 +15,7 @@ from modules.users import (
     update_user,
     delete_user,
     set_user_active,
+    set_user_email,
     migrate_notification_preference,
 )
 from modules.products import (
@@ -191,6 +192,9 @@ def route_request(action, data, request):
 
     elif action == "setUserActive":
         return set_user_active(data, caller, db)
+
+    elif action == "setUserEmail":
+        return set_user_email(data, caller, db)
     
     elif action == "getClients":
         return get_clients(decoded_token, db)

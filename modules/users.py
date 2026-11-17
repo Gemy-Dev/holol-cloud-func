@@ -1,4 +1,6 @@
 """User management module for CRUD operations."""
+import re
+
 from firebase_admin import auth, firestore
 import firebase_admin
 from flask import jsonify
@@ -138,6 +140,49 @@ def update_user(data, caller, db):
     user_data["updatedBy"] = caller.uid
     user_ref.update(user_data)
     return jsonify({"success": True})
+
+
+_EMAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+
+def set_user_email(data, caller, db):
+    """Change an account's e-mail in Firebase Auth and on its document (WEB-15).
+
+    The dashboard wrote the new address to the document only, so the account
+    went on signing in — and receiving password-reset links — at the old one.
+    Auth is changed first: if it refuses (the address is taken, or invalid),
+    the document keeps the address the account really signs in with.
+    """
+    uid = data.get("uid") or data.get("id")
+    email = (data.get("email") or "").strip().lower()
+    if not uid:
+        return jsonify({"error": "uid is required"}), 400
+    if not _EMAIL_PATTERN.match(email):
+        return jsonify({"error": "A valid email is required"}), 400
+
+    user_ref = db.collection("users").document(uid)
+    if not user_ref.get().exists:
+        return jsonify({"error": "User not found"}), 404
+
+    try:
+        auth.update_user(uid, email=email)
+    except auth.EmailAlreadyExistsError:
+        return jsonify({"error": "This email is already used by another account"}), 409
+    except auth.UserNotFoundError:
+        # A document without a sign-in account: nothing signs in with it.
+        pass
+    except ValueError:
+        return jsonify({"error": "A valid email is required"}), 400
+    except Exception as error:
+        print(f"set_user_email: Auth update failed for {uid}: {error}")
+        return jsonify({"error": "Failed to update the sign-in account"}), 500
+
+    user_ref.update({
+        "email": email,
+        "updatedAt": now_iso(),
+        "updatedBy": caller.uid,
+    })
+    return jsonify({"success": True, "email": email})
 
 
 def set_user_active(data, caller, db):
