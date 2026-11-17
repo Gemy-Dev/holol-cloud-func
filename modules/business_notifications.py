@@ -212,6 +212,9 @@ REVIEW_DECISIONS = {
     'main_opportunities': ('reviewState', 'الفرصة',
                            lambda rid: {'action': 'open_main_opportunity',
                                         'mainOpportunityId': rid}),
+    # A plan records its decision in `status`; its creator is told. Plans
+    # made before the dashboard recorded creatorId have no one to tell.
+    'plans': ('status', 'الخطة', lambda rid: {'action': 'open_plan', 'planId': rid}),
 }
 _REVIEWER_ROLES = ('admin', 'salesManager')
 
@@ -231,7 +234,7 @@ def _decision(record, field):
 
 
 def _owners(collection, record):
-    if collection == 'clients':
+    if collection in ('clients', 'plans'):
         ids = [record.get('creatorId')]
     elif collection == 'tasks':
         ids = [record.get('assignedToId')]

@@ -107,3 +107,38 @@ def test_an_unknown_collection_is_refused(db, app_context):
     _seed(db)
     _, status, _ = _call(db, "mgr", "users", "rep")
     assert status == 400
+
+
+def test_a_rejected_plan_tells_its_creator_with_the_reason(db, app_context):
+    _seed(db)
+    db._put("plans", "p1", {"title": "خطة الربع الأول", "status": "deleted",
+                            "rejectionReason": "الأهداف عالية", "creatorId": "rep"})
+
+    body, _, send = _call(db, "mgr", "plans", "p1")
+
+    assert body["decision"] == "rejected"
+    kwargs = send.call_args.kwargs
+    assert kwargs["user_id"] == "rep"
+    assert kwargs["title"] == "تم رفض الخطة"
+    assert "خطة الربع الأول" in kwargs["body"] and "الأهداف عالية" in kwargs["body"]
+    assert kwargs["message_data"]["action"] == "open_plan"
+
+
+def test_a_deleted_plan_is_not_announced_as_rejected(db, app_context):
+    _seed(db)
+    db._put("plans", "p1", {"status": "deleted", "deletedAt": "2026-11-01", "creatorId": "rep"})
+
+    body, _, send = _call(db, "mgr", "plans", "p1")
+
+    assert body["skipped"] == "not_decided"
+    send.assert_not_called()
+
+
+def test_a_plan_without_a_recorded_creator_tells_nobody(db, app_context):
+    _seed(db)
+    db._put("plans", "p1", {"status": "approved"})
+
+    body, _, send = _call(db, "mgr", "plans", "p1")
+
+    assert body["skipped"] == "no_owner"
+    send.assert_not_called()
