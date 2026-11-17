@@ -104,3 +104,40 @@ def test_an_unset_date_is_neither_repaired_nor_reported():
         "targetDate": None, "deletedAt": "", "startDate": None,
     })
     assert changes == {} and unreadable == []
+
+
+def test_dates_inside_visit_history_are_repaired():
+    changes, unreadable = dr.changes_for("technical_support", {
+        "visitHistory": [
+            {"id": "v1", "visitDate": "2026-09-04T07:30:00.000Z", "notes": "x"},
+            {"id": "v2", "visitDate": "2026-09-05T10:00:00.000"},
+        ],
+    })
+    assert unreadable == []
+    assert changes["visitHistory"] == [
+        {"id": "v1", "visitDate": "2026-09-04T10:30:00.000", "notes": "x"},
+        {"id": "v2", "visitDate": "2026-09-05T10:00:00.000"},
+    ]
+
+
+def test_date_change_entries_repair_from_and_to():
+    changes, _ = dr.changes_for("tasks", {
+        "dateChanges": [{"from": "2026-09-04 10:30:00.000", "to": None,
+                         "changedAt": "2026-09-04T10:30:00.000", "reason": "x"}],
+    })
+    assert changes["dateChanges"][0]["from"] == "2026-09-04T10:30:00.000"
+    assert changes["dateChanges"][0]["to"] is None
+
+
+def test_a_list_already_in_shape_is_not_rewritten():
+    changes, unreadable = dr.changes_for("tasks", {
+        "dateChanges": [{"from": "2026-09-04T10:30:00.000", "to": "2026-09-05T10:30:00.000"}],
+    })
+    assert changes == {} and unreadable == []
+
+
+def test_an_unreadable_nested_date_is_reported_with_its_place():
+    _, unreadable = dr.changes_for("technical_support", {
+        "visitHistory": [{"id": "v1", "visitDate": "soon"}],
+    })
+    assert unreadable == ["visitHistory[0].visitDate"]
