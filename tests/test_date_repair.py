@@ -97,3 +97,10 @@ def test_a_dry_run_writes_nothing(db):
 
     assert report["repaired"] == 1 and written == []
     assert db._get_all("tasks")["t1"]["targetDate"] == "2026-09-04T07:30:00.000Z"
+
+
+def test_an_unset_date_is_neither_repaired_nor_reported():
+    changes, unreadable = dr.changes_for("tasks", {
+        "targetDate": None, "deletedAt": "", "startDate": None,
+    })
+    assert changes == {} and unreadable == []

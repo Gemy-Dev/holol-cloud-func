@@ -74,6 +74,9 @@ def changes_for(collection, data):
     for name, value in data.items():
         if not is_date_field(name) or (collection, name) in EXEMPT:
             continue
+        # An empty date is a date not set — nothing to repair, nothing to report.
+        if value is None or value == "":
+            continue
         fixed = repaired(value)
         if fixed is None:
             unreadable.append(name)
