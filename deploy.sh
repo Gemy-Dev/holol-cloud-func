@@ -321,6 +321,31 @@ setup_schedulers() {
             --location="$REGION" --project="$PROJECT_ID"
     fi
 
+    # Every night at 03:00 Iraq time, rewrite any stored date not in the R1
+    # shape — what a phone on an old release may still write (modules/date_repair.py).
+    if gcloud scheduler jobs describe repair-stored-dates --location="$REGION" --project="$PROJECT_ID" &>/dev/null; then
+        gcloud scheduler jobs update http repair-stored-dates \
+            --schedule="0 3 * * *" --time-zone="Asia/Baghdad" \
+            --uri="$FUNCTION_URL" --http-method=POST \
+            --update-headers="Content-Type=application/json" \
+            --message-body='{"action":"repair_stored_dates"}' \
+            --oidc-service-account-email="$SCHEDULER_SA" \
+            --oidc-token-audience="$FUNCTION_URL" \
+            --attempt-deadline=540s \
+            --location="$REGION" --project="$PROJECT_ID"
+    else
+        gcloud scheduler jobs create http repair-stored-dates \
+            --schedule="0 3 * * *" --time-zone="Asia/Baghdad" \
+            --uri="$FUNCTION_URL" --http-method=POST \
+            --headers="Content-Type=application/json" \
+            --message-body='{"action":"repair_stored_dates"}' \
+            --oidc-service-account-email="$SCHEDULER_SA" \
+            --oidc-token-audience="$FUNCTION_URL" \
+            --attempt-deadline=540s \
+            --description="Nightly repair of stored dates into the R1 shape" \
+            --location="$REGION" --project="$PROJECT_ID"
+    fi
+
     return $?
 }
 

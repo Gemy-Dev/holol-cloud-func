@@ -65,6 +65,7 @@ from modules.review_reminders import handle_report_saved
 from modules.business_notifications import handle_business_notification, handle_review_decision
 from modules.review_emails import send_report_deleted_email
 from modules.role_reminders import handle_role_reminders
+from modules.date_repair import handle_repair_stored_dates
 from modules.special_requests import (
     handle_decide_special_request,
     handle_edit_special_request_note,
@@ -143,6 +144,10 @@ def route_request(action, data, request):
         return handle_daily_notifications(db, days_offset=1)
 
     # Compatibility route for the former morning digest; now uses role policy.
+    elif action == "repair_stored_dates":
+        # Nightly: rewrites stored dates into the R1 shape (modules/date_repair).
+        return handle_repair_stored_dates(db, data)
+
     elif action == "review_reminders":
         return handle_role_reminders(db)
 

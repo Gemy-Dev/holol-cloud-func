@@ -105,6 +105,7 @@ ACTION_REQUIREMENTS = {
     "notify_tomorrow_tasks": (SCHEDULER,),
     "review_reminders": (SCHEDULER,),
     "role_reminders": (SCHEDULER,),
+    "repair_stored_dates": (SCHEDULER,),
 
     # Users.
     "create": ("addUser",),
