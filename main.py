@@ -54,12 +54,6 @@ from modules.notifications import (
     handle_send_review_notification,
 )
 from modules.email import send_email, send_daily_report, notify_new_deal, send_support_visit_report
-from modules.apk_manager import (
-    upload_apks,
-    get_apk_download_url,
-    get_all_apk_versions,
-    delete_apk_version,
-)
 from modules.opportunities import get_opportunity_stats
 from modules.review_reminders import handle_report_saved
 from modules.business_notifications import handle_business_notification, handle_review_decision
@@ -329,19 +323,6 @@ def route_request(action, data, request):
     elif action == "retrySpecialRequestSend":
         return handle_retry_special_request_send(decoded_token, data, db)
 
-    # APK Management (any active account may download)
-    elif action == "getApkDownloadUrl":
-        return get_apk_download_url(data, db)
-
-    # APK Management (admin only)
-    elif action == "uploadApks":
-        return upload_apks(data, decoded_token, db)
-
-    elif action == "getAllApkVersions":
-        return get_all_apk_versions(decoded_token, db)
-
-    elif action == "deleteApkVersion":
-        return delete_apk_version(data, decoded_token, db)
 
     else:
         return jsonify({"error": "Invalid action"}), 400

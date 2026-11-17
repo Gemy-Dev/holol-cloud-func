@@ -20,7 +20,6 @@ from modules.notifications import (
     handle_send_notification_to_all,
     handle_send_review_notification,
 )
-from modules.apk_manager import _send_notifications_to_android_users
 from tests.conftest import is_contract_iso
 
 
@@ -280,22 +279,6 @@ class TestDailyReminder:
         assert body['count'] == 0
         [record] = _records(db)
         assert record['delivery']['reason'] == 'no_valid_registration'
-
-
-class TestApkUpdate:
-    def test_recorded_for_every_android_user(self, db):
-        db._put('users', 'droid', _user('token-d', platforms=['Android']))
-        db._put('users', 'droid-offline', _user(None, platforms=['android']))
-        db._put('users', 'iphone', _user('token-i', platforms=['ios']))
-
-        with patch('modules.apk_manager.messaging') as m:
-            sent, errors = _send_notifications_to_android_users('1.7.0', db, sender_id='admin')
-
-        assert (sent, errors) == (1, [])
-        [record] = _records(db)
-        assert set(record['recipientIds']) == {'droid', 'droid-offline'}
-        assert record['kind'] == 'apk_update'
-        assert m.Message.call_args.kwargs['data']['notificationId'] == record['id']
 
 
 class TestTodaysCount:

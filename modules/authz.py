@@ -148,7 +148,6 @@ ACTION_REQUIREMENTS = {
     "getAllTasksStats": (ACTIVE,),
     "getCompletedTasksStatus": (ACTIVE,),
     "getOpportunityStats": (ACTIVE,),
-    "getApkDownloadUrl": (ACTIVE,),
 
     # Notifications and emails. Every field-app build sends these on ordinary
     # work, so gating them on a grant would silence the current release; they
@@ -172,10 +171,6 @@ ACTION_REQUIREMENTS = {
     "editSpecialRequestNote": (ACTIVE,),
     "retrySpecialRequestSend": (ACTIVE,),
 
-    # APK management: the handlers keep their own admin check.
-    "uploadApks": (ACTIVE,),
-    "getAllApkVersions": (ACTIVE,),
-    "deleteApkVersion": (ACTIVE,),
 }
 
 # ----------------------------------------------------------------- callers

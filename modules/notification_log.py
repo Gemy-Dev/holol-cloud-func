@@ -11,8 +11,8 @@ Document shape, ``notifications/{id}``:
     title, body   what the recipient saw
     data          the FCM data payload — the ``action`` and record ids that open
                   the record when the notification is tapped
-    kind          direct | broadcast | review | daily_tasks | apk_update |
-                  review_request | review_digest | special_request
+    kind          direct | broadcast | review | daily_tasks | review_request |
+                  review_digest | special_request
     source        app | dashboard | system
     senderId      uid from the verified ID token; None for the scheduler
     senderName    the sender's name at send time, for display
